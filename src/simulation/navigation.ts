@@ -2,6 +2,8 @@ import { SIZE, type Point } from "./config";
 // Static occupancy and clearance share the same authority as building placement.
 export class Navigation {
   cells = new Uint8Array(SIZE * SIZE);
+  /** Static terrain blocking (water, cliffs) that every rebuild starts from. */
+  terrain = new Uint8Array(SIZE * SIZE);
   version = 0;
   index(x: number, z: number) {
     return z * SIZE + x;

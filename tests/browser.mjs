@@ -41,10 +41,11 @@ try {
     /Stronghold/,
   );
   await page.getByRole("button", { name: "Train worker" }).click();
-  await page.waitForTimeout(200);
-  assert.equal(
-    await page.evaluate(() => window.rts.world.population(0).reserved),
-    1,
+  // Commands apply on the next simulation step.
+  await page.waitForFunction(
+    () => window.rts.world.population(0).reserved === 1,
+    null,
+    { timeout: 5000 },
   );
   await page.locator("#queue button").click();
   // Software WebGL renders only a few frames per second; wait on state, not time.
@@ -127,10 +128,14 @@ try {
     w.own(1).find((e) => e.kind === "base").hp = 0;
     w.step();
   });
-  await page.waitForTimeout(200);
-  assert.match(
-    await page.locator("#modal-title").innerText(),
-    /frontier is yours/,
+  // The result dialog opens on the next rendered frame.
+  await page.waitForFunction(
+    () =>
+      /frontier is yours/.test(
+        document.getElementById("modal-title").textContent,
+      ),
+    null,
+    { timeout: 5000 },
   );
   // Entity meshes are rebuilt by the next rendered frame after a restart.
   const synced = () =>

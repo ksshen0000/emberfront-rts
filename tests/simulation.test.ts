@@ -2,6 +2,14 @@ import { describe, it, expect } from "vitest";
 import { World, VISIBLE, EXPLORED, type Entity } from "../src/simulation/world";
 import { Navigation } from "../src/simulation/navigation";
 import {
+  FORDS,
+  PLATEAUS,
+  heightAt,
+  layout,
+  mirror,
+  riverPoint,
+} from "../src/simulation/terrain";
+import {
   STEP,
   SPECS,
   START,
@@ -196,10 +204,10 @@ describe("navigation", () => {
       player: 0,
       ids: units.map((e) => e.id),
       type: "move",
-      point: { x: 65, z: 35 },
+      point: { x: 76, z: 32 },
     });
     advance(w, 30);
-    expect(units.filter((e) => distance(e, { x: 65, z: 35 }) < 5)).toHaveLength(
+    expect(units.filter((e) => distance(e, { x: 76, z: 32 }) < 5)).toHaveLength(
       20,
     );
     w.assertInvariants();
@@ -269,9 +277,9 @@ describe("fog of war", () => {
     const w = fresh(),
       u = worker(w),
       r = SPECS.worker.sight!;
-    w.submit({ player: 0, ids: [u.id], type: "move", point: { x: 64, z: 30 } });
-    advance(w, 30);
-    expect(distance(u, { x: 64, z: 30 })).toBeLessThan(2);
+    w.submit({ player: 0, ids: [u.id], type: "move", point: { x: 76, z: 32 } });
+    advance(w, 40);
+    expect(distance(u, { x: 76, z: 32 })).toBeLessThan(2);
     expect(fogAt(w, 0, u.x + r - 1.5, u.z) & VISIBLE).toBeTruthy();
     expect(fogAt(w, 0, u.x + r + 1.5, u.z) & VISIBLE).toBeFalsy();
     // The start position stays explored but is no longer lit by this worker alone.
@@ -286,5 +294,90 @@ describe("fog of war", () => {
     w.updateFog();
     expect(fogAt(w, 0, enemy.x, enemy.z) & VISIBLE).toBeFalsy();
     expect(w.sees(0, enemy)).toBe(true);
+  });
+});
+
+describe("terrain", () => {
+  it("the main plateau is walled by cliffs and reached by its ramps", () => {
+    const w = fresh(),
+      p = PLATEAUS[0];
+    // Rim cells facing the map corner are cliff faces.
+    for (const a of [200, 225, 250].map((d) => (d * Math.PI) / 180)) {
+      const x = p.x + Math.cos(a) * (p.r + 0.2),
+        z = p.z + Math.sin(a) * (p.r + 0.2);
+      expect(w.nav.canStand(x, z)).toBe(false);
+    }
+    // The walk down never jumps a cliff: consecutive steps change height gently.
+    const path = w.nav.path({ x: 28.5, z: 30.5 }, { x: 60, z: 20 })!;
+    expect(path).not.toBeNull();
+    let prev = heightAt(28.5, 30.5);
+    for (const q of path) {
+      const h = heightAt(q.x, q.z);
+      expect(Math.abs(h - prev)).toBeLessThan(0.6);
+      prev = h;
+    }
+    expect(prev).toBeLessThan(0.6);
+  });
+  it("the river can only be crossed at the fords", () => {
+    const w = fresh();
+    // Along the channel, only the fords are walkable.
+    for (let i = 3; i <= 97; i++) {
+      const p = riverPoint(i / 100),
+        nearFord = FORDS.some((f) => Math.hypot(p.x - f.x, p.z - f.z) < 3),
+        farFromFord = FORDS.every((f) => Math.hypot(p.x - f.x, p.z - f.z) > 7);
+      if (nearFord) expect(w.nav.canStand(p.x, p.z)).toBe(true);
+      if (farFromFord) expect(w.nav.canStand(p.x, p.z)).toBe(false);
+    }
+    // With the three fords closed, the two halves of the map are cut apart.
+    expect(
+      w.nav.path({ x: 28.5, z: 30.5 }, { x: 99.5, z: 97.5 }),
+    ).not.toBeNull();
+    for (const f of FORDS)
+      for (let dz = -8; dz <= 8; dz++)
+        for (let dx = -8; dx <= 8; dx++)
+          if (Math.hypot(dx, dz) <= 8)
+            w.nav.cells[
+              w.nav.index(Math.floor(f.x) + dx, Math.floor(f.z) + dz)
+            ] = 1;
+    w.nav.version++;
+    expect(w.nav.path({ x: 28.5, z: 30.5 }, { x: 99.5, z: 97.5 })).toBeNull();
+  });
+  it("buildings need dry, level ground", () => {
+    const w = fresh(),
+      p = PLATEAUS[0],
+      ramp = p.ramps[0],
+      onRamp = w.snap("farm", {
+        x: p.x + Math.cos(ramp) * (p.r + 2),
+        z: p.z + Math.sin(ramp) * (p.r + 2),
+      });
+    expect(w.placement("farm", onRamp)).toMatch(/steep|Blocked/);
+    expect(w.placement("farm", w.snap("farm", FORDS[1]))).toMatch(
+      /steep|wet|Blocked/,
+    );
+    expect(w.placement("farm", { x: 34.5, z: 24.5 })).toBeNull();
+  });
+  it("refuses a building that would wall the strongholds off from each other", () => {
+    const w = fresh();
+    // A wall right across the map with a single three-cell gap at x 90-92.
+    for (let x = 0; x < 128; x++)
+      if (x < 90 || x > 92) w.nav.cells[w.nav.index(x, 60)] = 1;
+      else w.nav.cells[w.nav.index(x, 60)] = 0;
+    expect(w.seals({ x: 91.5, z: 60.5 }, 3)).toBe(true);
+    expect(w.seals({ x: 70.5, z: 30.5 }, 3)).toBe(false);
+  });
+  it("is the same map from both sides", () => {
+    const key = (p: { kind: string; x: number; z: number }) =>
+      `${p.kind}:${p.x}:${p.z}`;
+    const all = layout(),
+      keys = new Set(all.map(key));
+    for (const p of all)
+      expect(keys.has(key({ ...p, ...mirror(p) }))).toBe(true);
+    for (let i = 0; i < 200; i++) {
+      const x = (i * 37.3) % 128,
+        z = (i * 71.9) % 128;
+      expect(heightAt(x, z)).toBeCloseTo(heightAt(128 - x, 128 - z), 5);
+    }
+    // Each side owns a main, a natural and a contested gold mine.
+    expect(all.filter((p) => p.kind === "gold")).toHaveLength(6);
   });
 });

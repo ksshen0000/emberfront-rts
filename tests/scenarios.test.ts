@@ -5,6 +5,7 @@ import {
   STEP,
   SPECS,
   FOOD_MAX,
+  GOLD_MINE,
   isUnit,
 } from "../src/simulation/config";
 const advance = (w: World, seconds: number) => {
@@ -138,16 +139,21 @@ it("same commands and steps reproduce the same world state", () => {
 it("depleted gold mine is removed and the worker moves on to the next mine", () => {
   const w = new World();
   w.aiEnabled = false;
-  const mines = [...w.entities.values()].filter((e) => e.kind === "gold");
-  const near = mines.sort((a, b) => a.x - b.x)[0],
+  const home = w.own(0).find((e) => e.kind === "base")!,
+    mines = [...w.entities.values()]
+      .filter((e) => e.kind === "gold")
+      .sort((a, b) => distance(a, home) - distance(b, home));
+  // The main mine runs dry; the next closest is the natural expansion.
+  const near = mines[0],
     far = mines[1];
   near.amount = 20;
   const u = w.own(0).find((e) => e.kind === "worker")!;
   w.submit({ player: 0, ids: [u.id], type: "gather", target: near.id });
   advance(w, 60);
   expect(w.entities.has(near.id)).toBe(false);
-  // Both trips were credited exactly once; nothing was lost with the mine.
-  expect(w.players[0].gold).toBe(520);
+  // Every unit of gold is credited exactly once: the 20 from the empty mine
+  // plus whatever has left the next mine, minus what the worker still carries.
+  expect(w.players[0].gold).toBe(500 + 20 + (GOLD_MINE - far.amount) - u.carry);
   expect(u.order).toEqual({ type: "gather", target: far.id });
   // The freed cells are walkable again.
   expect(w.nav.canStand(near.x, near.z)).toBe(true);
@@ -193,7 +199,7 @@ it("attack-move fights an enemy on the way and then continues to its destination
   w.aiEnabled = false;
   const squad: Entity[] = [];
   for (let i = 0; i < 5; i++)
-    squad.push(w.spawn("soldier", 0, 40.5, 28.5 + i * 1.2));
+    squad.push(w.spawn("soldier", 0, 47.5, 28.5 + i * 1.2));
   const enemy = w.spawn("soldier", 1, 56.5, 31);
   const goal = { x: 80.5, z: 31 };
   w.submit({

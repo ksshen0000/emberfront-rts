@@ -12,6 +12,7 @@ import {
   type Point,
 } from "./simulation/config";
 import { Battlefield } from "./rendering/battlefield";
+import { WATER_LEVEL } from "./simulation/terrain";
 import { CURSORS, cursorImage } from "./cursors";
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -821,6 +822,15 @@ backdrop.width = backdrop.height = 180;
   const b = backdrop.getContext("2d")!;
   b.imageSmoothingQuality = "high";
   b.drawImage(view.terrain, 0, 0, 180, 180);
+  // The ground texture shows the riverbed; paint the water surface over it.
+  b.fillStyle = "#2f6f7d";
+  for (let y = 0; y < 180; y++)
+    for (let x = 0; x < 180; x++)
+      if (
+        view.height(((x + 0.5) / 180) * SIZE, (1 - (y + 0.5) / 180) * SIZE) <
+        WATER_LEVEL
+      )
+        b.fillRect(x, y, 1, 1);
   b.fillStyle = "#1a261c40";
   b.fillRect(0, 0, 180, 180);
   b.strokeStyle = "#c4cca81a";

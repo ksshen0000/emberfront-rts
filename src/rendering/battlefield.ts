@@ -8,6 +8,8 @@ import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
+import { VertexBuffer } from "@babylonjs/core/Buffers/buffer";
+import { VertexData } from "@babylonjs/core/Meshes/mesh.vertexData";
 import { Mesh } from "@babylonjs/core/Meshes/mesh";
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
 import type { InstancedMesh } from "@babylonjs/core/Meshes/instancedMesh";
@@ -41,10 +43,27 @@ import {
   type World,
   type Entity,
 } from "../simulation/world";
+import {
+  FORDS,
+  LOWLAND,
+  WATER_LEVEL,
+  heightAt,
+  layout,
+  mirror,
+  terrainBlocking,
+} from "../simulation/terrain";
+// Height grid resolution: CELL samples per world unit, GRID cells across the map.
+const CELL = 2,
+  GRID = SIZE * CELL;
+const smoothstep = (a: number, b: number, v: number) => {
+  const t = Math.max(0, Math.min(1, (v - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+};
 interface View {
   root: TransformNode;
-  ring: InstancedMesh;
-  bar: TransformNode;
+  /** Selection ring and health bar; trees and mines have neither. */
+  ring: InstancedMesh | null;
+  bar: TransformNode | null;
   fill: InstancedMesh | null;
   fillColor: string;
   barWidth: number;
@@ -113,6 +132,8 @@ export class Battlefield {
   fogTarget = new Float32Array(SIZE * SIZE);
   fogVersion = -2;
   fogSnap = true;
+  heights = new Float32Array((GRID + 1) * (GRID + 1));
+  ripples!: DynamicTexture;
   /** Painted ground texture, shared with the minimap background. */
   terrain!: HTMLCanvasElement;
   static readonly ZOOM_MIN = 10;
@@ -133,6 +154,8 @@ export class Battlefield {
     to?: Vector3;
     arc?: boolean;
     grow?: number;
+    /** Ground height under a growing effect. */
+    y?: number;
   }[] = [];
   fx = true;
   constructor(public canvas: HTMLCanvasElement) {
@@ -220,22 +243,48 @@ export class Battlefield {
       seed = (seed * 1664525 + 1013904223) >>> 0;
       return seed / 4294967296;
     };
-    // Dark forest floor beyond the playable area so map edges never show the void.
-    const outskirts = MeshBuilder.CreateGround(
-      "outskirts",
-      { width: SIZE + 160, height: SIZE + 160 },
-      this.scene,
-    );
-    outskirts.position.set(SIZE / 2, -0.08, SIZE / 2);
-    outskirts.material = this.mat("outskirts", "#34452f");
-    outskirts.isPickable = false;
-    outskirts.receiveShadows = true;
+    // Terrain heights on a half-unit grid, shared by the ground mesh, the
+    // painted texture and everything that stands on the ground.
+    const H = this.heights;
+    for (let j = 0; j <= GRID; j++)
+      for (let i = 0; i <= GRID; i++)
+        H[j * (GRID + 1) + i] = heightAt(i / CELL, j / CELL);
+    // Dark forest floor framing the playable area so map edges never show the
+    // void. A frame, not a sheet: under the map it would cover the river.
+    const border = 80;
+    for (const [w, d, x, z] of [
+      [SIZE + 2 * border, border, SIZE / 2, -border / 2],
+      [SIZE + 2 * border, border, SIZE / 2, SIZE + border / 2],
+      [border, SIZE, -border / 2, SIZE / 2],
+      [border, SIZE, SIZE + border / 2, SIZE / 2],
+    ]) {
+      const outskirts = MeshBuilder.CreateGround(
+        "outskirts",
+        { width: w, height: d },
+        this.scene,
+      );
+      outskirts.position.set(x, LOWLAND, z);
+      outskirts.material = this.mat("outskirts", "#34452f");
+      outskirts.isPickable = false;
+      outskirts.receiveShadows = true;
+    }
     const ground = MeshBuilder.CreateGround(
       "ground",
-      { width: SIZE, height: SIZE, subdivisions: 1 },
+      { width: SIZE, height: SIZE, subdivisions: GRID, updatable: true },
       this.scene,
     );
-    ground.position.set(SIZE / 2, -0.04, SIZE / 2);
+    ground.position.set(SIZE / 2, 0, SIZE / 2);
+    const positions = ground.getVerticesData(VertexBuffer.PositionKind)!;
+    for (let v = 0; v < positions.length; v += 3)
+      positions[v + 1] = this.height(
+        positions[v] + SIZE / 2,
+        positions[v + 2] + SIZE / 2,
+      );
+    ground.updateVerticesData(VertexBuffer.PositionKind, positions);
+    const normals: number[] = [];
+    VertexData.ComputeNormals(positions, ground.getIndices()!, normals);
+    ground.updateVerticesData(VertexBuffer.NormalKind, normals);
+    ground.refreshBoundingInfo();
     ground.metadata = { ground: true };
     ground.receiveShadows = true;
     const T = 2048,
@@ -287,14 +336,41 @@ export class Battlefield {
       );
     }
     ctx.globalAlpha = 1;
-    // Worn dirt road between the two settlements, drawn in soft layers.
+    const resources = layout();
+    // Shaded forest floor under every woodline.
+    for (const t of resources)
+      if (t.kind === "tree") blob(px(t.x), pz(t.z), 3.2 * k, "#2f42305c");
+    // Worn dirt road: down the east ramp, through the centre ford and up the
+    // enemy's ramp, drawn as a smooth curve in soft layers.
+    const half = [
+      { x: 24, z: 24 },
+      { x: 33, z: 25 },
+      { x: 44, z: 27.5 },
+      { x: 51, z: 38 },
+      { x: 57, z: 53 },
+      FORDS[1],
+    ];
+    const route = [...half, ...half.slice(0, -1).reverse().map(mirror)];
     const road = (width: number, color: string) => {
       ctx.strokeStyle = color;
       ctx.lineWidth = width;
-      ctx.lineCap = "round";
+      ctx.lineCap = ctx.lineJoin = "round";
       ctx.beginPath();
-      ctx.moveTo(px(24), pz(24));
-      ctx.bezierCurveTo(px(44), pz(46), px(84), pz(82), px(104), pz(104));
+      ctx.moveTo(px(route[0].x), pz(route[0].z));
+      for (let i = 1; i < route.length - 1; i++) {
+        const mid = {
+          x: (route[i].x + route[i + 1].x) / 2,
+          z: (route[i].z + route[i + 1].z) / 2,
+        };
+        ctx.quadraticCurveTo(
+          px(route[i].x),
+          pz(route[i].z),
+          px(mid.x),
+          pz(mid.z),
+        );
+      }
+      const last = route[route.length - 1];
+      ctx.lineTo(px(last.x), pz(last.z));
       ctx.stroke();
     };
     road(86, "#6d6d4c55");
@@ -323,18 +399,111 @@ export class Battlefield {
         );
       }
     }
-    // Trampled earth around resource sites.
-    for (const [x, z] of [
-      [13, 23],
-      [SIZE - 13, SIZE - 23],
-    ])
-      blob(px(x), pz(z), 110, "#7b7155cc");
-    for (const [x, z] of [
-      [19.5, 39.5],
-      [SIZE - 19.5, SIZE - 39.5],
-      [60.5, 61],
-    ])
-      blob(px(x), pz(z), 150, "#3e533866");
+    // Trampled earth around every gold mine.
+    for (const g of resources)
+      if (g.kind === "gold") blob(px(g.x), pz(g.z), 110, "#7b7155cc");
+    // Terrain classes from height and slope: cliff rock, ramp dirt, plateau
+    // grass, shore sand and riverbed, blended over the painted ground so its
+    // grain shows through.
+    const tint = new Float32Array((GRID + 1) * (GRID + 1) * 4);
+    for (let j = 0; j <= GRID; j++)
+      for (let i = 0; i <= GRID; i++) {
+        const at = (ii: number, jj: number) =>
+            H[
+              Math.min(GRID, Math.max(0, jj)) * (GRID + 1) +
+                Math.min(GRID, Math.max(0, ii))
+            ],
+          h = at(i, j),
+          slope =
+            Math.hypot(
+              at(i + 1, j) - at(i - 1, j),
+              at(i, j + 1) - at(i, j - 1),
+            ) *
+            (CELL / 2);
+        const layers: [number, number, number, number][] = [
+          // Underwater: dark riverbed, deeper is darker.
+          [0.2, 0.27, 0.24, smoothstep(WATER_LEVEL + 0.05, -0.7, h)],
+          // Shore: pale sand just above the waterline.
+          [
+            0.62,
+            0.57,
+            0.43,
+            0.85 *
+              (1 - smoothstep(0.08, 0.22, Math.abs(h - WATER_LEVEL - 0.08))),
+          ],
+          // Plateau tops: sunlit, drier grass.
+          [0.47, 0.53, 0.33, 0.3 * smoothstep(1.2, 1.6, h)],
+          // Ramps: trodden dirt where the slope is walkable.
+          [
+            0.55,
+            0.49,
+            0.36,
+            0.75 *
+              smoothstep(0.1, 0.2, slope) *
+              (1 - smoothstep(0.4, 0.55, slope)) *
+              smoothstep(0.5, 0.8, h),
+          ],
+          // Cliff faces: bare rock.
+          [0.46, 0.44, 0.38, smoothstep(0.5, 1.0, slope)],
+        ];
+        let r = 0,
+          g = 0,
+          b = 0,
+          w = 0;
+        for (const [lr, lg, lb, la] of layers) {
+          r = r * (1 - la) + lr * la;
+          g = g * (1 - la) + lg * la;
+          b = b * (1 - la) + lb * la;
+          w = w * (1 - la) + la;
+        }
+        const o = (j * (GRID + 1) + i) * 4;
+        // Store premultiplied colour so interpolation stays clean at edges.
+        tint[o] = r;
+        tint[o + 1] = g;
+        tint[o + 2] = b;
+        tint[o + 3] = w;
+      }
+    const image = ctx.getImageData(0, 0, T, T),
+      data = image.data,
+      perCell = T / GRID;
+    for (let y = 0; y < T; y++) {
+      // Grid row j counts from the south edge; texture rows from the north.
+      const gz = (T - 1 - y + 0.5) / perCell,
+        j0 = Math.min(GRID - 1, Math.floor(gz)),
+        fz = gz - j0;
+      for (let x = 0; x < T; x++) {
+        const gx = (x + 0.5) / perCell,
+          i0 = Math.min(GRID - 1, Math.floor(gx)),
+          fx = gx - i0,
+          o00 = (j0 * (GRID + 1) + i0) * 4,
+          o10 = o00 + 4,
+          o01 = o00 + (GRID + 1) * 4,
+          o11 = o01 + 4,
+          w00 = (1 - fx) * (1 - fz),
+          w10 = fx * (1 - fz),
+          w01 = (1 - fx) * fz,
+          w11 = fx * fz,
+          a =
+            tint[o00 + 3] * w00 +
+            tint[o10 + 3] * w10 +
+            tint[o01 + 3] * w01 +
+            tint[o11 + 3] * w11;
+        if (a < 0.01) continue;
+        const p = (y * T + x) * 4,
+          // Keep the painted grain: scale the layer colour by local brightness.
+          grain = (data[p] + data[p + 1] + data[p + 2]) / (3 * 105);
+        for (let c = 0; c < 3; c++) {
+          const layer =
+            tint[o00 + c] * w00 +
+            tint[o10 + c] * w10 +
+            tint[o01 + c] * w01 +
+            tint[o11 + c] * w11;
+          data[p + c] =
+            data[p + c] * (1 - a) + Math.min(255, layer * 255 * grain) * a;
+        }
+      }
+    }
+    ctx.putImageData(image, 0, 0);
     // Soft darkening toward the map rim.
     const rim = ctx.createRadialGradient(
       T / 2,
@@ -352,7 +521,48 @@ export class Battlefield {
     const mat = this.mat("terrain", "#ffffff");
     mat.diffuseTexture = texture;
     ground.material = mat;
+    // Water: one translucent sheet at the waterline; the ground hides it on land.
+    const ripples = new DynamicTexture(
+      "ripples",
+      { width: 256, height: 256 },
+      this.scene,
+      true,
+    );
+    const rctx = ripples.getContext() as CanvasRenderingContext2D;
+    rctx.fillStyle = "#3d7480";
+    rctx.fillRect(0, 0, 256, 256);
+    rctx.lineCap = "round";
+    for (let i = 0; i < 140; i++) {
+      const x = random() * 256,
+        y = random() * 256,
+        w = 8 + random() * 26;
+      rctx.strokeStyle = random() < 0.5 ? "#7fb3b866" : "#2b5a6366";
+      rctx.lineWidth = 1 + random() * 1.5;
+      rctx.beginPath();
+      rctx.moveTo(x, y);
+      rctx.quadraticCurveTo(x + w / 2, y - 2, x + w, y);
+      rctx.stroke();
+    }
+    ripples.update(true);
+    ripples.uScale = ripples.vScale = 10;
+    this.ripples = ripples;
+    const water = MeshBuilder.CreateGround(
+      "water",
+      { width: SIZE, height: SIZE },
+      this.scene,
+    );
+    water.position.set(SIZE / 2, WATER_LEVEL, SIZE / 2);
+    const waterMat = this.mat("water", "#ffffff");
+    waterMat.diffuseTexture = ripples;
+    waterMat.alpha = 0.78;
+    waterMat.specularColor = Color3.FromHexString("#a9d2d6");
+    waterMat.specularPower = 48;
+    // Units wading through a ford stay visible above the surface.
+    waterMat.disableDepthWrite = true;
+    water.material = waterMat;
+    water.isPickable = false;
     // Nonblocking scenery: each kind is one mesh drawn with thin instances.
+    // Matrices are collected first and uploaded as one static buffer.
     const scatter = (
       template: Mesh,
       count: number,
@@ -360,27 +570,35 @@ export class Battlefield {
     ) => {
       template.isPickable = false;
       template.receiveShadows = true;
+      const matrices: number[] = [];
       for (let i = 0; i < count; i++) {
         const p = place();
         if (!p) continue;
         const [x, z, scale, yaw] = p;
-        template.thinInstanceAdd(
-          Matrix.Compose(
-            new Vector3(scale, scale * (0.8 + random() * 0.5), scale),
-            Quaternion.RotationYawPitchRoll(yaw, 0, 0),
-            new Vector3(x, 0, z),
-          ),
-          i === count - 1,
-        );
+        Matrix.Compose(
+          new Vector3(scale, scale * (0.8 + random() * 0.5), scale),
+          Quaternion.RotationYawPitchRoll(yaw, 0, 0),
+          new Vector3(x, this.height(x, z), z),
+        ).copyToArray(matrices, matrices.length);
       }
+      template.thinInstanceSetBuffer(
+        "matrix",
+        new Float32Array(matrices),
+        16,
+        true,
+      );
       template.thinInstanceRefreshBoundingInfo();
       return template;
     };
+    const blocked = terrainBlocking();
     const clearOf = (x: number, z: number) =>
       [
         [24, 24],
         [SIZE - 24, SIZE - 24],
-      ].every(([bx, bz]) => Math.hypot(x - bx, z - bz) > 8);
+      ].every(([bx, bz]) => Math.hypot(x - bx, z - bz) > 8) &&
+      // Dry, gentle ground only: no flowers on cliffs or in the river.
+      !blocked[Math.floor(z) * SIZE + Math.floor(x)] &&
+      this.height(x, z) > WATER_LEVEL + 0.15;
     const field = () => {
       const x = 2 + random() * (SIZE - 4),
         z = 2 + random() * (SIZE - 4);
@@ -401,17 +619,21 @@ export class Battlefield {
     tuft.bakeTransformIntoVertices(Matrix.Translation(0, 0.2, 0));
     tuft.material = this.mat("grass", "#7a9159");
     scatter(tuft, 900, field);
-    const flower = MeshBuilder.CreateSphere(
-      "flower",
-      { diameter: 0.16, segments: 2 },
-      this.scene,
-    );
-    flower.bakeTransformIntoVertices(Matrix.Translation(0, 0.1, 0));
-    flower.material = this.mat("flower", "#e8d9a0");
-    scatter(flower, 260, field);
-    const bloom = flower.clone("flower-red");
-    bloom.material = this.mat("flower-red", "#d98a73");
-    scatter(bloom, 140, field);
+    // Separate meshes, not clones: a clone shares geometry, and with it the
+    // thin-instance buffer, so two scatters would overwrite each other.
+    for (const [name, color, count] of [
+      ["flower", "#e8d9a0", 260],
+      ["flower-red", "#d98a73", 140],
+    ] as const) {
+      const flower = MeshBuilder.CreateSphere(
+        name,
+        { diameter: 0.16, segments: 2 },
+        this.scene,
+      );
+      flower.bakeTransformIntoVertices(Matrix.Translation(0, 0.1, 0));
+      flower.material = this.mat(name, color);
+      scatter(flower, count, field);
+    }
     const pebble = MeshBuilder.CreateSphere(
       "pebble",
       { diameter: 0.5, segments: 1 },
@@ -434,6 +656,36 @@ export class Battlefield {
     bush.material = this.mat("bush", "#46653f");
     scatter(bush, 110, field);
     this.shadows.addShadowCaster(bush);
+    // Rubble along every cliff face, so plateaus read as rock walls.
+    const cliffs: Point[] = [];
+    for (let z = 0; z < SIZE; z++)
+      for (let x = 0; x < SIZE; x++) {
+        const h = this.height(x + 0.5, z + 0.5);
+        if (blocked[z * SIZE + x] && h > WATER_LEVEL + 0.3)
+          cliffs.push({ x, z });
+      }
+    const rubble = MeshBuilder.CreatePolyhedron(
+      "rubble",
+      { type: 2, size: 0.55 },
+      this.scene,
+    );
+    rubble.scaling.y = 0.75;
+    rubble.bakeCurrentTransformIntoVertices();
+    rubble.convertToFlatShadedMesh();
+    rubble.material = this.mat("rubble", "#80796a");
+    let next = 0;
+    scatter(rubble, cliffs.length * 2, () => {
+      const c = cliffs[next++ % cliffs.length];
+      return random() < 0.6
+        ? [
+            c.x + random(),
+            c.z + random(),
+            0.5 + random() * 0.9,
+            random() * 6.28,
+          ]
+        : null;
+    });
+    this.shadows.addShadowCaster(rubble);
     // A dense pine wall around the playable area frames the battlefield.
     const rimTree = () => {
       const side = Math.floor(random() * 4),
@@ -486,6 +738,21 @@ export class Battlefield {
     scatter(forest, 520, rimTree);
     this.updateCamera();
   }
+  /** Ground height at a world position, bilinear on the terrain grid. */
+  height(x: number, z: number) {
+    const gx = Math.max(0, Math.min(GRID - 1e-6, x * CELL)),
+      gz = Math.max(0, Math.min(GRID - 1e-6, z * CELL)),
+      i = Math.floor(gx),
+      j = Math.floor(gz),
+      fx = gx - i,
+      fz = gz - j,
+      H = this.heights,
+      o = j * (GRID + 1) + i;
+    return (
+      (H[o] * (1 - fx) + H[o + 1] * fx) * (1 - fz) +
+      (H[o + GRID + 1] * (1 - fx) + H[o + GRID + 2] * fx) * fz
+    );
+  }
   mat(name: string, hex: string, emissive = false) {
     let m = this.materials.get(name);
     if (!m) {
@@ -507,7 +774,7 @@ export class Battlefield {
     // Keep the same orbit offset while translating the observation point.
     // Babylon otherwise rebuilds alpha/beta/radius from the old camera position.
     this.camera.setTarget(
-      new Vector3(this.focus.x, 0, this.focus.z),
+      new Vector3(this.focus.x, LOWLAND, this.focus.z),
       false,
       false,
       true,
@@ -654,7 +921,8 @@ export class Battlefield {
         }
       } else if (isBuilding(e.kind)) {
         const s = SPECS[e.kind].size;
-        box(s, 0.3, s, 0, 0.15, 0, dark);
+        // Deep footing so the building sits flush on gently sloping ground.
+        box(s, 0.8, s, 0, -0.1, 0, dark);
         if (e.kind === "base") {
           box(4, 3.4, 4, 0, 1.8, 0, stone);
           cone(6, 2.5, 0, 4.5, 0, team);
@@ -746,38 +1014,50 @@ export class Battlefield {
       body.position.x = (hash(e.id, 5) - 0.5) * 0.7;
       body.position.z = (hash(e.id, 6) - 0.5) * 0.7;
     } else if (e.kind === "rock") body.rotation.y = hash(e.id, 4) * Math.PI * 2;
-    const diameter = isUnit(e.kind) ? 1.25 : SPECS[e.kind].size * 1.35;
-    const ring = this.overlay(`ring-${diameter}-${e.owner === 1}`, root, () => {
-      const m = MeshBuilder.CreateTorus(
-        "selection",
-        { diameter, thickness: 0.055, tessellation: 40 },
-        this.scene,
-      );
-      m.material = this.mat(
-        e.owner === 1 ? "selected-enemy" : "selected",
-        e.owner === 1 ? "#f0a184" : "#bde7b0",
-        true,
-      );
-      return m;
-    });
-    ring.position.y = 0.06;
-    ring.setEnabled(false);
-    // Health bars face the fixed camera; the fill shrinks from the left edge.
-    const barWidth = isUnit(e.kind) ? 1.1 : 3;
-    const bar = new TransformNode("hp", this.scene);
-    bar.parent = root;
-    bar.position.y = isUnit(e.kind) ? 2 : e.kind === "base" ? 6.4 : 4.8;
-    bar.rotation.x = Math.PI / 2 - this.camera.beta;
-    this.overlay(`hp-back-${barWidth}`, bar, () => {
-      const m = MeshBuilder.CreatePlane(
-        "hp-back",
-        { width: barWidth + 0.08, height: 0.2 },
-        this.scene,
-      );
-      m.material = this.mat("hp-back", "#151b17", true);
-      return m;
-    });
-    root.position.set(e.x, 0, e.z);
+    const neutral = e.owner === 2,
+      barWidth = isUnit(e.kind) ? 1.1 : 3;
+    let ring: InstancedMesh | null = null,
+      bar: TransformNode | null = null;
+    // Hundreds of trees and mines are never selected and show no health, so
+    // they skip the ring and bar entirely.
+    if (!neutral) {
+      const diameter = isUnit(e.kind) ? 1.25 : SPECS[e.kind].size * 1.35;
+      ring = this.overlay(`ring-${diameter}-${e.owner === 1}`, root, () => {
+        const m = MeshBuilder.CreateTorus(
+          "selection",
+          { diameter, thickness: 0.055, tessellation: 40 },
+          this.scene,
+        );
+        m.material = this.mat(
+          e.owner === 1 ? "selected-enemy" : "selected",
+          e.owner === 1 ? "#f0a184" : "#bde7b0",
+          true,
+        );
+        return m;
+      });
+      ring.position.y = 0.06;
+      ring.setEnabled(false);
+      // Health bars face the fixed camera; the fill shrinks from the left edge.
+      bar = new TransformNode("hp", this.scene);
+      bar.parent = root;
+      bar.position.y = isUnit(e.kind) ? 2 : e.kind === "base" ? 6.4 : 4.8;
+      bar.rotation.x = Math.PI / 2 - this.camera.beta;
+      this.overlay(`hp-back-${barWidth}`, bar, () => {
+        const m = MeshBuilder.CreatePlane(
+          "hp-back",
+          { width: barWidth + 0.08, height: 0.2 },
+          this.scene,
+        );
+        m.material = this.mat("hp-back", "#151b17", true);
+        return m;
+      });
+    }
+    root.position.set(e.x, this.height(e.x, e.z), e.z);
+    if (neutral) {
+      // Resources never move; skip their transform updates every frame.
+      root.freezeWorldMatrix();
+      body.freezeWorldMatrix();
+    }
     const view: View = {
       root,
       ring,
@@ -877,6 +1157,9 @@ export class Battlefield {
   }
   sync(world: World, dt: number) {
     this.syncFog(world, dt);
+    // Slow current along the river.
+    this.ripples.uOffset = (this.ripples.uOffset + dt * 0.012) % 1;
+    this.ripples.vOffset = (this.ripples.vOffset - dt * 0.008) % 1;
     for (const [id, v] of this.views)
       if (!world.entities.has(id)) {
         const seen = this.sees(world, v.root.position, v.half);
@@ -894,6 +1177,8 @@ export class Battlefield {
           e.owner !== this.fogOwner &&
           e.owner !== 2 &&
           !world.sees(this.fogOwner, e);
+      // Resources are static once created.
+      if (e.owner === 2) continue;
       if (hidden) {
         // Enemy units vanish in fog; enemy buildings keep their last seen state.
         if (!v.remembered) v.root.setEnabled(false);
@@ -901,11 +1186,13 @@ export class Battlefield {
       }
       if (!v.root.isEnabled()) {
         v.root.setEnabled(true);
-        v.root.position.set(e.x, 0, e.z);
+        v.root.position.set(e.x, this.height(e.x, e.z), e.z);
       }
       if (isBuilding(e.kind) && e.owner !== this.fogOwner) v.remembered = true;
       v.root.position.x += (e.x - v.root.position.x) * Math.min(1, dt * 22);
       v.root.position.z += (e.z - v.root.position.z) * Math.min(1, dt * 22);
+      if (isUnit(e.kind))
+        v.root.position.y = this.height(v.root.position.x, v.root.position.z);
       if (e.kind === "worker") {
         // Loaded workers show a gold nugget or log bundle on their pack.
         const load = e.carry > 0 ? e.carryKind : "";
@@ -947,15 +1234,12 @@ export class Battlefield {
           : 0;
       } else if (isBuilding(e.kind))
         v.body.scaling.y = 0.15 + e.progress * 0.85;
-      v.ring.setEnabled(this.selection.has(e.id));
-      v.bar.setEnabled(
-        e.owner !== 2 &&
-          (this.selection.has(e.id) ||
-            e.hp < SPECS[e.kind].hp ||
-            e.progress < 1),
+      v.ring?.setEnabled(this.selection.has(e.id));
+      v.bar?.setEnabled(
+        this.selection.has(e.id) || e.hp < SPECS[e.kind].hp || e.progress < 1,
       );
       const ratio = Math.max(0.01, e.hp / SPECS[e.kind].hp);
-      if (e.owner !== 2 && v.hp !== ratio) {
+      if (v.hp !== ratio) {
         v.hp = ratio;
         const [name, hex] =
           e.owner === 1
@@ -968,7 +1252,7 @@ export class Battlefield {
         if (v.fillColor !== name) {
           v.fill?.dispose();
           v.fillColor = name;
-          v.fill = this.overlay(`hp-${name}-${v.barWidth}`, v.bar, () => {
+          v.fill = this.overlay(`hp-${name}-${v.barWidth}`, v.bar!, () => {
             const m = MeshBuilder.CreatePlane(
               "hp-fill",
               { width: v.barWidth, height: 0.12 },
@@ -988,8 +1272,16 @@ export class Battlefield {
         this.effects.length < 80 &&
         (this.sees(world, effect.from) || this.sees(world, effect.to))
       ) {
-        const from = new Vector3(effect.from.x, 1, effect.from.z),
-          to = new Vector3(effect.to.x, 0.9, effect.to.z);
+        const from = new Vector3(
+            effect.from.x,
+            1 + this.height(effect.from.x, effect.from.z),
+            effect.from.z,
+          ),
+          to = new Vector3(
+            effect.to.x,
+            0.9 + this.height(effect.to.x, effect.to.z),
+            effect.to.z,
+          );
         if (effect.ranged) {
           const arrow = MeshBuilder.CreateBox(
             "arrow",
@@ -1046,7 +1338,7 @@ export class Battlefield {
         f.mesh.position.copyFrom(p);
       } else if (f.grow) {
         f.mesh.scaling.setAll(f.grow * (0.4 + t));
-        f.mesh.position.y = 0.3 + t * f.grow * 0.4;
+        f.mesh.position.y = (f.y ?? 0) + 0.3 + t * f.grow * 0.4;
         f.mesh.visibility = 1 - t;
       } else f.mesh.scaling.setAll(1 - t);
     }
@@ -1059,8 +1351,9 @@ export class Battlefield {
     );
     mesh.material = this.mat("dust", "#b9ad8c");
     mesh.isPickable = false;
-    mesh.position.set(at.x, 0.3, at.z);
-    this.effects.push({ mesh, life: 0.7, max: 0.7, grow: size });
+    const y = this.height(at.x, at.z);
+    mesh.position.set(at.x, y + 0.3, at.z);
+    this.effects.push({ mesh, life: 0.7, max: 0.7, grow: size, y });
   }
   pick(x: number, y: number) {
     const hit = this.scene.pick(
@@ -1084,7 +1377,7 @@ export class Battlefield {
   project(p: Point) {
     const rect = this.canvas.getBoundingClientRect();
     const projected = Vector3.Project(
-      new Vector3(p.x, 0, p.z),
+      new Vector3(p.x, this.height(p.x, p.z), p.z),
       Matrix.Identity(),
       this.scene.getTransformMatrix(),
       this.camera.viewport.toGlobal(
@@ -1118,7 +1411,7 @@ export class Battlefield {
     );
     m.alpha = 0.6;
     this.ghost.material = m;
-    if (p) this.ghost.position.set(p.x, 0.2, p.z);
+    if (p) this.ghost.position.set(p.x, this.height(p.x, p.z) + 0.2, p.z);
   }
   marker(p: Point, attack = false) {
     const mesh = MeshBuilder.CreateTorus(
@@ -1126,7 +1419,7 @@ export class Battlefield {
       { diameter: 1.4, thickness: 0.07, tessellation: 24 },
       this.scene,
     );
-    mesh.position.set(p.x, 0.1, p.z);
+    mesh.position.set(p.x, this.height(p.x, p.z) + 0.1, p.z);
     mesh.material = this.mat(
       attack ? "attack-mark" : "move-mark",
       attack ? "#ee9b70" : "#d0e1ac",

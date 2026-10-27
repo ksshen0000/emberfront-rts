@@ -173,5 +173,5 @@ export interface Point {
 export const distance = (a: Point, b: Point) =>
   Math.hypot(a.x - b.x, a.z - b.z);
 export const isUnit = (kind: Kind): kind is UnitKind => !!SPECS[kind].speed;
-export const isBuilding = (kind: Kind) =>
-  ["base", "farm", "barracks"].includes(kind);
+const BUILDINGS = new Set<Kind>(["base", "farm", "barracks"]);
+export const isBuilding = (kind: Kind) => BUILDINGS.has(kind);

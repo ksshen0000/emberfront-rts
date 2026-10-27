@@ -77,8 +77,8 @@ try {
   const hiddenPick = await page.evaluate(() => {
     const w = window.rts.world,
       v = window.rts.view,
-      e = w.spawn("soldier", 1, 60, 40);
-    v.focus = { x: 60, z: 40 };
+      e = w.spawn("soldier", 1, 76, 32);
+    v.focus = { x: 76, z: 32 };
     v.updateCamera();
     return e.id;
   });

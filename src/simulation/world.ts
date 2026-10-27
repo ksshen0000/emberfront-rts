@@ -21,8 +21,17 @@ import {
   type Point,
 } from "./config";
 import { Navigation } from "./navigation";
+import { buildable, layout, mirror, terrainBlocking } from "./terrain";
 export const VISIBLE = 1,
   EXPLORED = 2;
+// Just outside each stronghold, on the side facing the map centre.
+const START_SPOTS = [{ x: 28.5, z: 30.5 }, mirror({ x: 28.5, z: 30.5 })];
+const STEPS = [
+  [1, 0],
+  [-1, 0],
+  [0, 1],
+  [0, -1],
+];
 // AI tuning: WC3-like build — five miners, a small lumber crew, two barracks.
 // Waves grow so armies accumulate instead of trading six-for-six forever.
 const AI = {
@@ -153,21 +162,24 @@ export class World {
     for (const owner of [0, 1] as const) {
       const fog = this.fog[owner];
       for (let i = 0; i < fog.length; i++) fog[i] &= ~VISIBLE;
-      for (const e of this.entities.values()) {
+      for (const e of this.roster().actors) {
         if (e.owner !== owner) continue;
         const r = SPECS[e.kind].sight ?? 0;
+        // Each row of the sight circle is one contiguous run of cells whose
+        // centres lie within the radius.
         for (
           let z = Math.max(0, Math.floor(e.z - r));
           z <= Math.min(SIZE - 1, e.z + r);
           z++
-        )
-          for (
-            let x = Math.max(0, Math.floor(e.x - r));
-            x <= Math.min(SIZE - 1, e.x + r);
-            x++
-          )
-            if ((x + 0.5 - e.x) ** 2 + (z + 0.5 - e.z) ** 2 <= r * r)
-              fog[z * SIZE + x] = VISIBLE | EXPLORED;
+        ) {
+          const dz = z + 0.5 - e.z;
+          if (dz * dz > r * r) continue;
+          const half = Math.sqrt(r * r - dz * dz),
+            x0 = Math.max(0, Math.ceil(e.x - half - 0.5)),
+            x1 = Math.min(SIZE - 1, Math.floor(e.x + half - 0.5));
+          if (x1 >= x0)
+            fog.fill(VISIBLE | EXPLORED, z * SIZE + x0, z * SIZE + x1 + 1);
+        }
       }
     }
     this.fogVersion++;
@@ -224,39 +236,30 @@ export class World {
     return e;
   }
   setup() {
+    this.nav.terrain.set(terrainBlocking());
     for (const owner of [0, 1] as const) {
-      const mirror = (v: number) => (owner ? SIZE - v : v);
-      this.spawn("base", owner, mirror(24), mirror(24));
-      for (let i = 0; i < 5; i++)
-        this.spawn("worker", owner, mirror(20 + i * 1.5), mirror(30));
-      this.spawn("gold", 2, mirror(13), mirror(23));
-      for (let i = 0; i < 12; i++)
-        this.spawn(
-          "tree",
-          2,
-          mirror(12 + (i % 6) * 3),
-          mirror(37 + Math.floor(i / 6) * 3),
-        );
+      const side = (x: number, z: number) =>
+        owner ? mirror({ x, z }) : { x, z };
+      const base = side(24, 24);
+      this.spawn("base", owner, base.x, base.z);
+      for (let i = 0; i < 5; i++) {
+        const p = side(20 + i * 1.5, 30);
+        this.spawn("worker", owner, p.x, p.z);
+      }
     }
-    // A wooded central island leaves a wide route on either side.
-    for (let i = 0; i < 12; i++)
-      this.spawn("tree", 2, 56 + (i % 4) * 3, 58 + Math.floor(i / 4) * 3);
-    for (const p of [
-      { x: 58.5, z: 72.5 },
-      { x: 62.5, z: 73.5 },
-      { x: 68.5, z: 57.5 },
-    ])
-      this.spawn("rock", 2, p.x, p.z);
+    for (const p of layout()) this.spawn(p.kind, 2, p.x, p.z);
     this.rebuild();
   }
   rebuild() {
-    this.nav.cells.fill(0);
+    this.nav.cells.set(this.nav.terrain);
     for (const e of this.entities.values())
       if (!isUnit(e.kind)) this.nav.occupy(e, SPECS[e.kind].size);
     this.nav.version++;
   }
   own(owner: Owner) {
-    return [...this.entities.values()].filter((e) => e.owner === owner);
+    return owner === 2
+      ? [...this.entities.values()].filter((e) => e.owner === 2)
+      : this.roster().actors.filter((e) => e.owner === owner);
   }
   // Food: units consume it, completed Stronghold and farms provide it.
   population(owner: Owner) {
@@ -356,12 +359,12 @@ export class World {
     const s = SPECS[kind].size / 2;
     if (p.x - s < 3 || p.z - s < 3 || p.x + s > SIZE - 3 || p.z + s > SIZE - 3)
       return "Outside the buildable area.";
-    // Reserve two full-width corridors so building cannot seal the map.
-    if ((p.x + s > 43 && p.x - s < 48) || (p.x + s > 80 && p.x - s < 85))
-      return "Keep this route clear. Choose another location.";
     for (let x = Math.floor(p.x - s); x < Math.ceil(p.x + s); x++)
       for (let z = Math.floor(p.z - s); z < Math.ceil(p.z + s); z++)
-        if (this.nav.blocked(x, z)) return "Blocked by a building or resource.";
+        if (this.nav.blocked(x, z))
+          return "Blocked by terrain, a building or a resource.";
+    if (!buildable(p, SPECS[kind].size))
+      return "The ground here is too steep or wet to build on.";
     for (const e of this.entities.values())
       if (
         isUnit(e.kind) &&
@@ -369,12 +372,134 @@ export class World {
         Math.abs(e.z - p.z) < s + 0.5
       )
         return "A unit is standing here.";
+    if (this.seals(p, SPECS[kind].size))
+      return "This would wall off the route between the strongholds.";
     return null;
   }
+  /** Whether all open cells around a rectangle connect within a margin around it. */
+  locallyConnected(
+    x0: number,
+    z0: number,
+    x1: number,
+    z1: number,
+    solid: (x: number, z: number) => boolean,
+  ) {
+    const m = 10,
+      wx0 = Math.max(0, x0 - m),
+      wz0 = Math.max(0, z0 - m),
+      wx1 = Math.min(SIZE, x1 + m),
+      wz1 = Math.min(SIZE, z1 + m),
+      ring: number[] = [];
+    for (let x = x0 - 1; x <= x1; x++)
+      for (let z = z0 - 1; z <= z1; z++) {
+        const edge = x === x0 - 1 || x === x1 || z === z0 - 1 || z === z1;
+        if (edge && x >= 0 && z >= 0 && x < SIZE && z < SIZE && !solid(x, z))
+          ring.push(z * SIZE + x);
+      }
+    if (ring.length <= 1) return ring.length === 1;
+    const reach = this.reach.fill(0),
+      queue = this.queue;
+    let head = 0,
+      tail = 0;
+    reach[ring[0]] = 1;
+    queue[tail++] = ring[0];
+    while (head < tail) {
+      const id = queue[head++],
+        x = id % SIZE,
+        z = (id - x) / SIZE;
+      for (const [dx, dz] of STEPS) {
+        const nx = x + dx,
+          nz = z + dz;
+        if (nx < wx0 || nz < wz0 || nx >= wx1 || nz >= wz1 || solid(nx, nz))
+          continue;
+        const n = nz * SIZE + nx;
+        if (reach[n]) continue;
+        reach[n] = 1;
+        queue[tail++] = n;
+      }
+    }
+    return ring.every((id) => reach[id]);
+  }
+  // Scratch buffers for the reachability check, reused between calls.
+  private reach = new Uint8Array(SIZE * SIZE);
+  private queue = new Int32Array(SIZE * SIZE);
+  /**
+   * Whether a footprint would cut the two starting positions off from each
+   * other. Ramps and fords are chokepoints, so a wall there could otherwise
+   * seal a base for good. Flood fill from one start, footprint treated as solid.
+   */
+  seals(p: Point, size: number) {
+    const s = size / 2,
+      x0 = Math.floor(p.x - s),
+      x1 = Math.ceil(p.x + s),
+      z0 = Math.floor(p.z - s),
+      z1 = Math.ceil(p.z + s),
+      solid = (x: number, z: number) =>
+        this.nav.blocked(x, z) || (x >= x0 && x < x1 && z >= z0 && z < z1);
+    const open = (q: Point) => {
+      const c = this.nav.nearest(q, 8);
+      return c && !solid(Math.floor(c.x), Math.floor(c.z)) ? c : null;
+    };
+    // Local test first: if the open cells hugging the footprint still reach
+    // each other within a small window, no route can have been cut.
+    if (this.locallyConnected(x0, z0, x1, z1, solid)) return false;
+    // Spawn rings beside each stronghold's starting position.
+    const a = open(START_SPOTS[0]),
+      b = open(START_SPOTS[1]);
+    if (!a || !b) return false;
+    const reach = this.reach.fill(0),
+      queue = this.queue;
+    let head = 0,
+      tail = 0;
+    const start = Math.floor(a.z) * SIZE + Math.floor(a.x),
+      goal = Math.floor(b.z) * SIZE + Math.floor(b.x);
+    reach[start] = 1;
+    queue[tail++] = start;
+    while (head < tail) {
+      const id = queue[head++];
+      if (id === goal) return false;
+      const x = id % SIZE,
+        z = (id - x) / SIZE;
+      for (const [dx, dz] of STEPS) {
+        const nx = x + dx,
+          nz = z + dz;
+        if (solid(nx, nz)) continue;
+        const n = nz * SIZE + nx;
+        if (reach[n]) continue;
+        reach[n] = 1;
+        queue[tail++] = n;
+      }
+    }
+    return true;
+  }
+  private lists: {
+    tick: number;
+    size: number;
+    units: Entity[];
+    actors: Entity[];
+  } | null = null;
+  /**
+   * Units and player-owned entities, cached per tick. Trees and mines are most
+   * of the map, so scanning only these keeps per-unit queries cheap.
+   */
+  roster() {
+    const l = this.lists;
+    if (l && l.tick === this.tick && l.size === this.entities.size) return l;
+    const units: Entity[] = [],
+      actors: Entity[] = [];
+    for (const e of this.entities.values()) {
+      if (e.owner !== 2) actors.push(e);
+      if (isUnit(e.kind)) units.push(e);
+    }
+    return (this.lists = {
+      tick: this.tick,
+      size: this.entities.size,
+      units,
+      actors,
+    });
+  }
   interactPoint(unit: Entity, target: Entity): Point | null {
-    const others = [...this.entities.values()].filter(
-      (e) => e.id !== unit.id && isUnit(e.kind),
-    );
+    const others = this.roster().units.filter((e) => e.id !== unit.id);
     const free = (p: Point) =>
       this.nav.canStand(p.x, p.z) && !others.some((e) => distance(e, p) < 0.7);
     if (unit.approach?.target === target.id && free(unit.approach.point))
@@ -599,11 +724,10 @@ export class World {
           e.autoTarget = undefined;
         }
         if (!target && this.tick % 5 === e.id % 5) {
-          target = [...this.entities.values()]
-            .filter(
+          target = this.roster()
+            .actors.filter(
               (t) =>
                 t.owner !== e.owner &&
-                t.owner !== 2 &&
                 this.gap(e, t) <= 6 &&
                 distance(e.anchor, t) < 12,
             )
@@ -702,8 +826,8 @@ export class World {
     const neighbors =
       e.stuck >= 0.5
         ? []
-        : [...this.entities.values()].filter(
-            (o) => o.id !== e.id && isUnit(o.kind) && distance(e, o) < 1.5,
+        : this.roster().units.filter(
+            (o) => o.id !== e.id && distance(e, o) < 1.5,
           );
     let moved = false;
     // Steer around neighbours first; the last two candidates slide along a
@@ -731,7 +855,9 @@ export class World {
       moved = true;
       break;
     }
-    if (moved) {
+    // Progress, not mere motion, clears the stuck timer: two units sliding
+    // sideways around each other forever would otherwise never yield.
+    if (moved && d - distance(e, point) > step * 0.25) {
       e.stuck = 0;
       e.failures = 0;
     } else {
@@ -858,9 +984,7 @@ export class World {
           p = { x: b.x + Math.cos(angle) * r, z: b.z + Math.sin(angle) * r };
         if (
           !this.nav.canStand(p.x, p.z) ||
-          [...this.entities.values()].some(
-            (e) => isUnit(e.kind) && distance(e, p) < 0.8,
-          )
+          this.roster().units.some((e) => distance(e, p) < 0.8)
         )
           continue;
         if (b.rally && !this.nav.path(p, b.rally)) continue;
