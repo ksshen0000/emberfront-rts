@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#141d19" />
+    <title>EMBERFRONT — A frontier RTS</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas
+        id="battlefield"
+        aria-label="Real-time strategy battlefield"
+      ></canvas>
+      <div class="vignette" aria-hidden="true"></div>
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="EMBERFRONT"
+          ><span class="crest">♜</span
+          ><span>EMBERFRONT<small>THE EMERALD MARCHES</small></span></a
+        >
+        <div class="match-label">
+          <i></i> Skirmish <span>/</span> Emerald Marches
+        </div>
+        <div class="resources">
+          <div title="Workers mine gold and return it to the stronghold">
+            <span class="resource-icon gold">◆</span
+            ><strong id="gold">500</strong><small>GOLD</small>
+          </div>
+          <div title="Workers cut trees and return wood to the stronghold">
+            <span class="resource-icon wood">♠</span
+            ><strong id="wood">150</strong><small>WOOD</small>
+          </div>
+          <div title="Food used + reserved / food cap">
+            <span class="resource-icon population">♟</span
+            ><strong id="population">5 / 12</strong><small>SUPPLY</small>
+          </div>
+        </div>
+        <span id="clock">00:00</span
+        ><button
+          id="pause"
+          class="icon-button"
+          title="Pause (Esc)"
+          aria-label="Pause game"
+        >
+          Ⅱ</button
+        ><button
+          id="help"
+          class="icon-button"
+          title="Field manual"
+          aria-label="Field manual"
+        >
+          ?</button
+        ><button
+          id="fullscreen"
+          class="icon-button"
+          title="Fullscreen (Alt+Enter)"
+          aria-label="Toggle fullscreen"
+          aria-pressed="false"
+        >
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+            <path
+              d="M1.5 5.5v-4h4M10.5 1.5h4v4M14.5 10.5v4h-4M5.5 14.5h-4v-4"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.6"
+            />
+          </svg>
+        </button>
+      </header>
+      <aside class="objective">
+        <span class="eyebrow">YOUR OBJECTIVE</span>
+        <h1>Build. Command. Conquer.</h1>
+        <p>
+          <span class="objective-diamond">◇</span> Destroy the enemy stronghold
+          in the northeast.
+        </p>
+        <div class="objective-progress">
+          <span id="phase">01</span>
+          <div>
+            <strong id="phase-title">Put your settlement to work</strong
+            ><small id="phase-desc"
+              >Select workers. Right-click gold or trees to gather.</small
+            >
+          </div>
+        </div>
+      </aside>
+      <div class="map-label">
+        <span>THE EMERALD MARCHES</span><i></i> Emerald Marches · Uncharted war.
+        Open terrain.
+      </div>
+      <div id="toast" role="status" aria-live="polite"></div>
+      <div id="mode-hint"></div>
+      <div id="selection-box"></div>
+      <div id="soft-cursor" aria-hidden="true"></div>
+      <footer class="command-deck">
+        <section class="minimap-panel">
+          <div class="panel-heading">
+            <span><i class="team-dot"></i> Emerald Marches</span
+            ><button id="home" title="Return to stronghold">⌂</button>
+          </div>
+          <canvas
+            id="minimap"
+            width="180"
+            height="180"
+            aria-label="Minimap. Click to move the camera."
+          ></canvas>
+          <div class="map-legend">
+            <span><i class="team-dot"></i> Your forces</span
+            ><span><i class="team-dot enemy"></i> Enemy</span>
+          </div>
+        </section>
+        <section class="selection-panel">
+          <div class="panel-heading">
+            <span>UNIT INTELLIGENCE</span
+            ><span id="selection-count">No selection</span>
+          </div>
+          <div id="selection-content"></div>
+          <div id="queue"></div>
+        </section>
+        <section class="orders-panel">
+          <div class="panel-heading">
+            <span>FIELD ORDERS</span><span id="order-subtitle">COMMANDS</span>
+          </div>
+          <div id="actions"></div>
+          <div class="quick-help">
+            <span><kbd>RMB</kbd> Command</span
+            ><span><kbd>Drag</kbd> Box select</span
+            ><span><kbd>MMB</kbd> Drag to pan</span>
+          </div>
+        </section>
+      </footer>
+      <div class="statusline">
+        <span><i></i> LOCAL SKIRMISH <b>·</b> Azure Guard vs Ember Legion</span
+        ><span id="stats">BABYLON.JS · PLAYABLE PROTOTYPE</span>
+      </div>
+      <div id="modal" class="modal-backdrop" hidden>
+        <div class="modal">
+          <span class="eyebrow" id="modal-eyebrow">EMBERFRONT</span>
+          <h2 id="modal-title">Battle paused</h2>
+          <div id="modal-body"></div>
+          <div class="modal-actions">
+            <button id="resume" class="primary">Resume battle</button
+            ><button id="restart">New battle</button>
+          </div>
+          <label class="fx-toggle"
+            ><input type="checkbox" id="effects" checked /> Simple combat
+            effects</label
+          ><label class="fx-toggle"
+            ><input type="checkbox" id="shadows" checked /> Dynamic
+            shadows</label
+          ><label class="fx-toggle"
+            ><input type="checkbox" id="confine" checked /> Confine the mouse to
+            the game window</label
+          >
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,1081 @@
+import {
+  SPECS,
+  SIZE,
+  STEP,
+  distance,
+  damageAgainst,
+  isUnit,
+  FOOD_MAX,
+  START,
+  GOLD_MINE,
+  QUEUE_MAX,
+  GOLD_TRIP,
+  GOLD_TIME,
+  WOOD_TRIP,
+  WOOD_CHOP,
+  WOOD_TIME,
+  isBuilding,
+  type Kind,
+  type UnitKind,
+  type BuildingKind,
+  type Point,
+} from "./config";
+import { Navigation } from "./navigation";
+export const VISIBLE = 1,
+  EXPLORED = 2;
+// AI tuning: WC3-like build — five miners, a small lumber crew, two barracks.
+// Waves grow so armies accumulate instead of trading six-for-six forever.
+const AI = {
+  miners: 5,
+  lumberjacks: 3,
+  barracks: 2,
+  expandGold: 300,
+  foodBuffer: 6,
+  wave: 6,
+  waveGrowth: 2,
+  waveMax: 16,
+};
+export type Owner = 0 | 1 | 2;
+export type Order =
+  | { type: "idle" }
+  | { type: "move" | "assault"; point: Point }
+  | { type: "attack" | "gather" | "build"; target: number };
+export interface Entity extends Point {
+  id: number;
+  kind: Kind;
+  owner: Owner;
+  hp: number;
+  progress: number;
+  queue: { kind: UnitKind; elapsed: number }[];
+  rally?: Point;
+  order: Order;
+  path: Point[];
+  pathVersion: number;
+  pathGoal?: Point;
+  retryAt: number;
+  stuck: number;
+  failures: number;
+  cooldown: number;
+  work: number;
+  carry: number;
+  carryKind: "gold" | "wood";
+  amount: number;
+  born: number;
+  heading: number;
+  anchor: Point;
+  autoTarget?: number;
+  approach?: { target: number; point: Point };
+  lastHit?: { id: number; kind: Kind; owner: Owner };
+}
+export interface LogEntry {
+  t: number;
+  owner: Owner;
+  event: string;
+  detail: string;
+}
+export interface Stats {
+  gold: number;
+  wood: number;
+  spent: number;
+  trained: number;
+  lost: number;
+  kills: number;
+  damage: number;
+}
+export interface Player {
+  gold: number;
+  wood: number;
+}
+export interface Command {
+  player: 0 | 1;
+  ids: number[];
+  type:
+    | "move"
+    | "assault"
+    | "attack"
+    | "gather"
+    | "build"
+    | "stop"
+    | "train"
+    | "cancel"
+    | "rally"
+    | "resume";
+  point?: Point;
+  target?: number;
+  kind?: UnitKind | BuildingKind;
+  index?: number;
+}
+export interface Effect {
+  from: Point;
+  to: Point;
+  owner: Owner;
+  ranged: boolean;
+}
+export class World {
+  entities = new Map<number, Entity>();
+  players: Player[] = [{ ...START }, { ...START }];
+  nav = new Navigation();
+  time = 0;
+  tick = 0;
+  seed = 0x9e3779b9;
+  paused = false;
+  result: null | "win" | "loss" | "draw" = null;
+  aiEnabled = true;
+  messages: string[] = [];
+  effects: Effect[] = [];
+  commands: Command[] = [];
+  nextId = 1;
+  pathBudget = 0;
+  // Players the built-in AI commands; the browser adds 0 for spectator mode.
+  aiPlayers: (0 | 1)[] = [1];
+  aiWaves = [0, 0];
+  // Battle log for headless AI-vs-AI runs; off in normal play to bound memory.
+  logging = false;
+  log: LogEntry[] = [];
+  stats: Stats[] = [0, 1].map(() => ({
+    gold: 0,
+    wood: 0,
+    spent: 0,
+    trained: 0,
+    lost: 0,
+    kills: 0,
+    damage: 0,
+  }));
+  // Fog of war per player, one byte per map cell: VISIBLE now and/or EXPLORED
+  // at some point. Simulation rules ignore it; the renderer and minimap read it.
+  fog = [new Uint8Array(SIZE * SIZE), new Uint8Array(SIZE * SIZE)];
+  fogVersion = 0;
+  constructor() {
+    this.setup();
+    this.updateFog();
+  }
+  updateFog() {
+    for (const owner of [0, 1] as const) {
+      const fog = this.fog[owner];
+      for (let i = 0; i < fog.length; i++) fog[i] &= ~VISIBLE;
+      for (const e of this.entities.values()) {
+        if (e.owner !== owner) continue;
+        const r = SPECS[e.kind].sight ?? 0;
+        for (
+          let z = Math.max(0, Math.floor(e.z - r));
+          z <= Math.min(SIZE - 1, e.z + r);
+          z++
+        )
+          for (
+            let x = Math.max(0, Math.floor(e.x - r));
+            x <= Math.min(SIZE - 1, e.x + r);
+            x++
+          )
+            if ((x + 0.5 - e.x) ** 2 + (z + 0.5 - e.z) ** 2 <= r * r)
+              fog[z * SIZE + x] = VISIBLE | EXPLORED;
+      }
+    }
+    this.fogVersion++;
+  }
+  /** Fog bits of the map cell under a point (0 outside the map). */
+  fogAt(owner: 0 | 1, x: number, z: number) {
+    const cx = Math.floor(x),
+      cz = Math.floor(z);
+    return cx < 0 || cz < 0 || cx >= SIZE || cz >= SIZE
+      ? 0
+      : this.fog[owner][cz * SIZE + cx];
+  }
+  /** Whether a player currently sees any part of an entity's footprint. */
+  sees(owner: 0 | 1, e: Entity) {
+    return (
+      e.owner === owner ||
+      this.seesArea(owner, e, isUnit(e.kind) ? 0 : SPECS[e.kind].size / 2)
+    );
+  }
+  /** Whether any cell of a square of half-width `half` around a point is visible. */
+  seesArea(owner: 0 | 1, p: Point, half: number) {
+    const h = Math.max(0, half - 0.01);
+    for (let z = Math.floor(p.z - h); z <= Math.floor(p.z + h); z++)
+      for (let x = Math.floor(p.x - h); x <= Math.floor(p.x + h); x++)
+        if (this.fogAt(owner, x, z) & VISIBLE) return true;
+    return false;
+  }
+  spawn(kind: Kind, owner: Owner, x: number, z: number, complete = true) {
+    const e: Entity = {
+      id: this.nextId++,
+      kind,
+      owner,
+      x,
+      z,
+      hp: SPECS[kind].hp * (complete ? 1 : 0.1),
+      progress: complete ? 1 : 0,
+      queue: [],
+      order: { type: "idle" },
+      path: [],
+      pathVersion: -1,
+      retryAt: 0,
+      stuck: 0,
+      failures: 0,
+      cooldown: 0,
+      work: 0,
+      carry: 0,
+      carryKind: "gold",
+      amount: kind === "gold" ? GOLD_MINE : kind === "tree" ? 500 : 0,
+      born: this.tick,
+      heading: 0,
+      anchor: { x, z },
+    };
+    this.entities.set(e.id, e);
+    return e;
+  }
+  setup() {
+    for (const owner of [0, 1] as const) {
+      const mirror = (v: number) => (owner ? SIZE - v : v);
+      this.spawn("base", owner, mirror(24), mirror(24));
+      for (let i = 0; i < 5; i++)
+        this.spawn("worker", owner, mirror(20 + i * 1.5), mirror(30));
+      this.spawn("gold", 2, mirror(13), mirror(23));
+      for (let i = 0; i < 12; i++)
+        this.spawn(
+          "tree",
+          2,
+          mirror(12 + (i % 6) * 3),
+          mirror(37 + Math.floor(i / 6) * 3),
+        );
+    }
+    // A wooded central island leaves a wide route on either side.
+    for (let i = 0; i < 12; i++)
+      this.spawn("tree", 2, 56 + (i % 4) * 3, 58 + Math.floor(i / 4) * 3);
+    for (const p of [
+      { x: 58.5, z: 72.5 },
+      { x: 62.5, z: 73.5 },
+      { x: 68.5, z: 57.5 },
+    ])
+      this.spawn("rock", 2, p.x, p.z);
+    this.rebuild();
+  }
+  rebuild() {
+    this.nav.cells.fill(0);
+    for (const e of this.entities.values())
+      if (!isUnit(e.kind)) this.nav.occupy(e, SPECS[e.kind].size);
+    this.nav.version++;
+  }
+  own(owner: Owner) {
+    return [...this.entities.values()].filter((e) => e.owner === owner);
+  }
+  // Food: units consume it, completed Stronghold and farms provide it.
+  population(owner: Owner) {
+    const all = this.own(owner);
+    return {
+      used: all.reduce(
+        (n, e) => n + (isUnit(e.kind) ? SPECS[e.kind].food : 0),
+        0,
+      ),
+      reserved: all.reduce(
+        (n, e) => n + e.queue.reduce((m, q) => m + SPECS[q.kind].food, 0),
+        0,
+      ),
+      cap: Math.min(
+        FOOD_MAX,
+        all.reduce(
+          (n, e) =>
+            n +
+            (isBuilding(e.kind) && e.progress === 1 ? -SPECS[e.kind].food : 0),
+          0,
+        ),
+      ),
+    };
+  }
+  // Deterministic damage roll (mulberry32) so replays stay reproducible.
+  random() {
+    let t = (this.seed = (this.seed + 0x6d2b79f5) | 0);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  record(owner: Owner, event: string, detail = "") {
+    if (this.logging)
+      this.log.push({
+        t: Math.round(this.time * 100) / 100,
+        owner,
+        event,
+        detail,
+      });
+  }
+  label(e: Entity) {
+    return `${e.kind}#${e.id}`;
+  }
+  notify(text: string, owner: Owner = 0) {
+    this.record(owner, "warn", text);
+    if (owner === 0 && !this.aiPlayers.includes(0)) {
+      this.messages.push(text);
+      if (this.messages.length > 8) this.messages.shift();
+    }
+  }
+  submit(command: Command) {
+    if (!this.paused && !this.result) this.commands.push(command);
+  }
+  setOrder(e: Entity, order: Order) {
+    e.order = order;
+    e.path = [];
+    e.pathGoal = undefined;
+    e.retryAt = 0;
+    e.stuck = 0;
+    e.failures = 0;
+    e.work = 0;
+    e.autoTarget = undefined;
+    e.approach = undefined;
+    e.anchor = { x: e.x, z: e.z };
+  }
+  pay(owner: 0 | 1, kind: Kind) {
+    const p = this.players[owner],
+      s = SPECS[kind];
+    if (p.gold < s.gold || p.wood < s.wood) {
+      this.notify("Not enough gold or wood.", owner);
+      return false;
+    }
+    p.gold -= s.gold;
+    p.wood -= s.wood;
+    this.stats[owner].spent += s.gold + s.wood;
+    return true;
+  }
+  gap(a: Entity, b: Entity) {
+    if (isUnit(b.kind)) return Math.max(0, distance(a, b) - 0.7);
+    const half = SPECS[b.kind].size / 2;
+    return Math.max(
+      0,
+      Math.hypot(
+        Math.max(0, Math.abs(a.x - b.x) - half),
+        Math.max(0, Math.abs(a.z - b.z) - half),
+      ) - 0.35,
+    );
+  }
+  snap(kind: BuildingKind, p: Point) {
+    const half = SPECS[kind].size / 2;
+    return {
+      x: Math.round(p.x - half) + half,
+      z: Math.round(p.z - half) + half,
+    };
+  }
+  placement(kind: BuildingKind, p: Point): string | null {
+    const s = SPECS[kind].size / 2;
+    if (p.x - s < 3 || p.z - s < 3 || p.x + s > SIZE - 3 || p.z + s > SIZE - 3)
+      return "Outside the buildable area.";
+    // Reserve two full-width corridors so building cannot seal the map.
+    if ((p.x + s > 43 && p.x - s < 48) || (p.x + s > 80 && p.x - s < 85))
+      return "Keep this route clear. Choose another location.";
+    for (let x = Math.floor(p.x - s); x < Math.ceil(p.x + s); x++)
+      for (let z = Math.floor(p.z - s); z < Math.ceil(p.z + s); z++)
+        if (this.nav.blocked(x, z)) return "Blocked by a building or resource.";
+    for (const e of this.entities.values())
+      if (
+        isUnit(e.kind) &&
+        Math.abs(e.x - p.x) < s + 0.5 &&
+        Math.abs(e.z - p.z) < s + 0.5
+      )
+        return "A unit is standing here.";
+    return null;
+  }
+  interactPoint(unit: Entity, target: Entity): Point | null {
+    const others = [...this.entities.values()].filter(
+      (e) => e.id !== unit.id && isUnit(e.kind),
+    );
+    const free = (p: Point) =>
+      this.nav.canStand(p.x, p.z) && !others.some((e) => distance(e, p) < 0.7);
+    if (unit.approach?.target === target.id && free(unit.approach.point))
+      return unit.approach.point;
+    const h = SPECS[target.kind].size / 2 + 0.65,
+      candidates: Point[] = [];
+    for (let side = 0; side < 4; side++)
+      for (let t = -h + 0.5; t < h; t += 1) {
+        const p =
+          side === 0
+            ? { x: target.x + t, z: target.z - h }
+            : side === 1
+              ? { x: target.x + h, z: target.z + t }
+              : side === 2
+                ? { x: target.x + t, z: target.z + h }
+                : { x: target.x - h, z: target.z + t };
+        if (free(p)) candidates.push(p);
+      }
+    const point =
+      candidates.sort((a, b) => distance(unit, a) - distance(unit, b))[0] ??
+      null;
+    unit.approach = point ? { target: target.id, point } : undefined;
+    return point;
+  }
+  apply(c: Command) {
+    const units = c.ids
+      .map((id) => this.entities.get(id))
+      .filter((e): e is Entity => !!e && e.owner === c.player);
+    if (!units.length) return;
+    if (c.type === "train") {
+      const b = units[0],
+        kind = c.kind;
+      if (
+        !kind ||
+        !isUnit(kind) ||
+        b.progress < 1 ||
+        !(
+          (b.kind === "base" && kind === "worker") ||
+          (b.kind === "barracks" && kind !== "worker")
+        )
+      )
+        return;
+      const p = this.population(c.player);
+      if (b.queue.length >= QUEUE_MAX) {
+        this.notify("Training queue is full.", c.player);
+        return;
+      }
+      if (p.used + p.reserved + SPECS[kind].food > p.cap) {
+        this.notify("Not enough food. Build more farms.", c.player);
+        return;
+      }
+      if (this.pay(c.player, kind)) {
+        b.queue.push({ kind, elapsed: 0 });
+        this.record(c.player, "queue", `${kind} at ${this.label(b)}`);
+      }
+      return;
+    }
+    if (c.type === "cancel") {
+      const b = units[0];
+      if (b.progress < 1 && isBuilding(b.kind)) {
+        const s = SPECS[b.kind];
+        this.players[c.player].gold += Math.floor(s.gold * 0.75);
+        this.players[c.player].wood += Math.floor(s.wood * 0.75);
+        this.record(c.player, "cancel", this.label(b));
+        this.remove(b);
+      } else {
+        const index = c.index ?? 0;
+        if (index < 0 || index >= b.queue.length) return;
+        const [q] = b.queue.splice(index, 1);
+        this.players[c.player].gold += SPECS[q.kind].gold;
+        this.players[c.player].wood += SPECS[q.kind].wood;
+      }
+      return;
+    }
+    if (
+      c.type === "build" &&
+      c.point &&
+      (c.kind === "farm" || c.kind === "barracks")
+    ) {
+      const kind = c.kind,
+        p = this.snap(kind, c.point),
+        error = this.placement(kind, p);
+      if (error) {
+        this.notify(error, c.player);
+        return;
+      }
+      const candidates = units
+        .filter((e) => e.kind === "worker")
+        .sort((a, b) => distance(a, p) - distance(b, p) || a.id - b.id);
+      const mock = { ...candidates[0], ...p, kind } as Entity;
+      let worker: Entity | undefined;
+      for (const w of candidates) {
+        const access = this.interactPoint(w, mock);
+        if (access && this.nav.path(w, access)) {
+          worker = w;
+          break;
+        }
+      }
+      if (!worker) {
+        this.notify(
+          "No selected worker can reach this construction site.",
+          c.player,
+        );
+        return;
+      }
+      if (!this.pay(c.player, kind)) return;
+      const b = this.spawn(kind, c.player, p.x, p.z, false);
+      this.record(
+        c.player,
+        "build",
+        `${this.label(b)} at (${p.x},${p.z}) by ${this.label(worker)}`,
+      );
+      this.rebuild();
+      this.setOrder(worker, { type: "build", target: b.id });
+      return;
+    }
+    const movable = units.filter((e) => isUnit(e.kind));
+    let i = 0;
+    for (const e of units) {
+      if (c.type === "rally" && isBuilding(e.kind) && c.point) {
+        e.rally = { ...c.point };
+        continue;
+      }
+      if (!isUnit(e.kind)) continue;
+      if (c.type === "stop") {
+        this.setOrder(e, { type: "idle" });
+        continue;
+      }
+      if ((c.type === "move" || c.type === "assault") && c.point) {
+        const columns = Math.ceil(Math.sqrt(movable.length));
+        const index = i++;
+        const p = {
+          x: c.point.x + ((index % columns) - (columns - 1) / 2) * 1.25,
+          z:
+            c.point.z +
+            (Math.floor(index / columns) -
+              (Math.ceil(movable.length / columns) - 1) / 2) *
+              1.25,
+        };
+        const dest = this.nav.nearest(p);
+        if (dest) this.setOrder(e, { type: c.type, point: dest });
+        continue;
+      }
+      const target = this.entities.get(c.target ?? -1);
+      if (!target) continue;
+      if (c.type === "attack" && target.owner !== e.owner && target.owner !== 2)
+        this.setOrder(e, { type: "attack", target: target.id });
+      if (
+        c.type === "gather" &&
+        e.kind === "worker" &&
+        (target.kind === "gold" || target.kind === "tree")
+      ) {
+        this.setOrder(e, { type: "gather", target: target.id });
+      }
+      if (
+        c.type === "resume" &&
+        e.kind === "worker" &&
+        target.owner === e.owner &&
+        target.progress < 1
+      ) {
+        if (
+          !this.own(e.owner).some(
+            (w) => w.order.type === "build" && w.order.target === target.id,
+          )
+        ) {
+          this.setOrder(e, { type: "build", target: target.id });
+          break;
+        }
+      }
+    }
+  }
+  remove(e: Entity) {
+    this.entities.delete(e.id);
+    if (!isUnit(e.kind)) this.rebuild();
+  }
+  step() {
+    if (this.paused || this.result) return;
+    this.tick++;
+    this.time = this.tick * STEP;
+    this.pathBudget = 5;
+    for (const c of this.commands.splice(0)) this.apply(c);
+    if (this.aiEnabled && this.tick % 10 === 0)
+      for (const owner of this.aiPlayers) this.ai(owner);
+    if (this.logging && this.tick % Math.round(30 / STEP) === 0)
+      for (const owner of [0, 1] as const) this.snapshot(owner);
+    const hits = new Map<number, number>();
+    for (const e of this.entities.values()) {
+      if (e.born === this.tick) continue;
+      if (isBuilding(e.kind)) {
+        this.produce(e);
+        continue;
+      }
+      if (!isUnit(e.kind)) continue;
+      e.cooldown = Math.max(0, e.cooldown - STEP);
+      if (e.order.type === "gather") {
+        this.gather(e);
+        continue;
+      }
+      if (e.order.type === "build") {
+        this.build(e);
+        continue;
+      }
+      if (e.order.type === "move") {
+        if (this.travel(e, e.order.point)) this.setOrder(e, { type: "idle" });
+        continue;
+      }
+      let target =
+        e.order.type === "attack"
+          ? this.entities.get(e.order.target)
+          : undefined;
+      if (e.order.type === "attack" && !target) {
+        this.setOrder(e, { type: "idle" });
+        continue;
+      }
+      if (e.order.type === "idle" || e.order.type === "assault") {
+        target = this.entities.get(e.autoTarget ?? -1);
+        if (
+          target &&
+          (distance(e.anchor, e) > 10 || target.owner === e.owner)
+        ) {
+          target = undefined;
+          e.autoTarget = undefined;
+        }
+        if (!target && this.tick % 5 === e.id % 5) {
+          target = [...this.entities.values()]
+            .filter(
+              (t) =>
+                t.owner !== e.owner &&
+                t.owner !== 2 &&
+                this.gap(e, t) <= 6 &&
+                distance(e.anchor, t) < 12,
+            )
+            .sort((a, b) => this.gap(e, a) - this.gap(e, b) || a.id - b.id)[0];
+          if (target) e.autoTarget = target.id;
+        }
+      }
+      if (target) {
+        const s = SPECS[e.kind];
+        if (this.gap(e, target) <= s.range!) {
+          e.path = [];
+          e.heading = Math.atan2(target.x - e.x, target.z - e.z);
+          if (e.cooldown <= 0) {
+            const damage = damageAgainst(s, this.random(), SPECS[target.kind]);
+            hits.set(target.id, (hits.get(target.id) ?? 0) + damage);
+            target.lastHit = { id: e.id, kind: e.kind, owner: e.owner };
+            if (e.owner !== 2) this.stats[e.owner].damage += damage;
+            e.cooldown = s.cooldown!;
+            this.effects.push({
+              from: { x: e.x, z: e.z },
+              to: { x: target.x, z: target.z },
+              owner: e.owner,
+              ranged: e.kind === "archer",
+            });
+          }
+        } else {
+          const p = isUnit(target.kind)
+            ? target
+            : this.interactPoint(e, target);
+          if (p) this.travel(e, p, 0.35);
+        }
+      } else if (e.order.type === "assault") {
+        e.anchor = { x: e.x, z: e.z };
+        if (this.travel(e, e.order.point)) this.setOrder(e, { type: "idle" });
+      }
+    }
+    for (const [id, damage] of hits) {
+      const e = this.entities.get(id);
+      if (e) e.hp -= damage;
+    }
+    for (const e of [...this.entities.values()])
+      if (e.hp <= 0) {
+        const k = e.lastHit;
+        if (e.owner !== 2) this.stats[e.owner].lost++;
+        if (k && k.owner !== 2) this.stats[k.owner].kills++;
+        this.record(
+          e.owner,
+          "death",
+          `${this.label(e)} at (${e.x.toFixed(1)},${e.z.toFixed(1)}) by ${k ? `${k.kind}#${k.id}` : "?"}`,
+        );
+        this.remove(e);
+      }
+    const a = this.own(0).some((e) => e.kind === "base"),
+      b = this.own(1).some((e) => e.kind === "base");
+    if (!a || !b) {
+      this.result = !a && !b ? "draw" : a ? "win" : "loss";
+      this.record(2, "result", this.result);
+    }
+    if (this.tick % 4 === 0) this.updateFog();
+    // A bounded event queue lets headless tests run without a renderer.
+    if (this.effects.length > 200)
+      this.effects.splice(0, this.effects.length - 200);
+  }
+  travel(e: Entity, goal: Point, tolerance = 0.25): boolean {
+    if (distance(e, goal) <= tolerance) return true;
+    if (e.retryAt > this.time) return false;
+    if (
+      e.pathVersion !== this.nav.version ||
+      !e.pathGoal ||
+      distance(e.pathGoal, goal) > 1.3 ||
+      !e.path.length
+    ) {
+      if (this.pathBudget <= 0) return false;
+      this.pathBudget--;
+      const path = this.nav.path(e, goal);
+      e.pathVersion = this.nav.version;
+      e.pathGoal = { ...goal };
+      if (!path) {
+        this.failedMove(e);
+        return false;
+      }
+      e.path = path;
+    }
+    const point = e.path[0];
+    if (!point) return false;
+    const d = distance(e, point),
+      step = Math.min(SPECS[e.kind].speed! * STEP, d);
+    if (d < 0.12) {
+      e.path.shift();
+      return !e.path.length && distance(e, goal) < 0.8;
+    }
+    const dx = (point.x - e.x) / d,
+      dz = (point.z - e.z) / d;
+    // Avoidance yields once a unit has waited a moment, so two units that
+    // want the same spot cannot deadlock each other into a failed move.
+    const neighbors =
+      e.stuck >= 0.5
+        ? []
+        : [...this.entities.values()].filter(
+            (o) => o.id !== e.id && isUnit(o.kind) && distance(e, o) < 1.5,
+          );
+    let moved = false;
+    // Steer around neighbours first; the last two candidates slide along a
+    // single axis so a body clipping a building corner can still get free.
+    const candidates = [0, 0.55, -0.55, 1.05, -1.05].map((angle) => ({
+      vx: dx * Math.cos(angle) - dz * Math.sin(angle),
+      vz: dx * Math.sin(angle) + dz * Math.cos(angle),
+    }));
+    if (Math.abs(dx) > 0.05) candidates.push({ vx: Math.sign(dx), vz: 0 });
+    if (Math.abs(dz) > 0.05) candidates.push({ vx: 0, vz: Math.sign(dz) });
+    for (const { vx, vz } of candidates) {
+      const next = { x: e.x + vx * step, z: e.z + vz * step };
+      if (!this.nav.segment(e, next)) continue;
+      if (
+        neighbors.some(
+          (o) =>
+            distance(next, o) < 0.67 &&
+            distance(next, o) < distance(e, o) - 0.001,
+        )
+      )
+        continue;
+      e.x = next.x;
+      e.z = next.z;
+      e.heading = Math.atan2(vx, vz);
+      moved = true;
+      break;
+    }
+    if (moved) {
+      e.stuck = 0;
+      e.failures = 0;
+    } else {
+      e.stuck += STEP;
+      if (e.stuck > 2) {
+        e.path = [];
+        e.stuck = 0;
+        this.failedMove(e);
+      }
+    }
+    return false;
+  }
+  failedMove(e: Entity) {
+    e.failures++;
+    e.retryAt = this.time + 0.5;
+    e.path = [];
+    this.record(
+      e.owner,
+      "stuck",
+      `${this.label(e)} at (${e.x.toFixed(1)},${e.z.toFixed(1)}) order ${e.order.type} try ${e.failures}`,
+    );
+    if (e.failures >= 3) {
+      this.notify(
+        "Some units cannot reach their destination. Try a different route.",
+        e.owner,
+      );
+      this.setOrder(e, { type: "idle" });
+    }
+  }
+  gather(e: Entity) {
+    if (e.order.type !== "gather") return;
+    let resource = this.entities.get(e.order.target);
+    if (
+      e.carry >= (e.carryKind === "gold" ? GOLD_TRIP : WOOD_TRIP) ||
+      (!resource && e.carry > 0) ||
+      (resource &&
+        e.carry > 0 &&
+        e.carryKind !== (resource.kind === "gold" ? "gold" : "wood"))
+    ) {
+      const base = this.own(e.owner).find((b) => b.kind === "base");
+      if (!base) return;
+      if (this.gap(e, base) <= 0.6) {
+        this.players[e.owner][e.carryKind] += e.carry;
+        if (e.owner !== 2) this.stats[e.owner][e.carryKind] += e.carry;
+        e.carry = 0;
+        e.path = [];
+        e.pathGoal = undefined;
+      } else {
+        const p = this.interactPoint(e, base);
+        if (p) this.travel(e, p);
+      }
+      return;
+    }
+    if (!resource) {
+      resource = [...this.entities.values()]
+        .filter((r) => r.kind === (e.carryKind === "gold" ? "gold" : "tree"))
+        .sort((a, b) => distance(e, a) - distance(e, b))[0];
+      if (!resource) {
+        this.setOrder(e, { type: "idle" });
+        this.notify("No resources of this type remain.", e.owner);
+        return;
+      }
+      e.order = { type: "gather", target: resource.id };
+    }
+    if (this.gap(e, resource) > 0.6) {
+      const p = this.interactPoint(e, resource);
+      if (p) this.travel(e, p);
+      return;
+    }
+    e.path = [];
+    e.work += STEP;
+    e.heading = Math.atan2(resource.x - e.x, resource.z - e.z);
+    const gold = resource.kind === "gold";
+    if (e.work + 1e-9 >= (gold ? GOLD_TIME : WOOD_TIME)) {
+      e.work = 0;
+      const take = Math.min(
+        gold ? GOLD_TRIP : WOOD_CHOP,
+        (gold ? GOLD_TRIP : WOOD_TRIP) - e.carry,
+        resource.amount,
+      );
+      resource.amount -= take;
+      e.carry += take;
+      e.carryKind = resource.kind === "gold" ? "gold" : "wood";
+      if (resource.amount <= 0) {
+        this.record(e.owner, "depleted", this.label(resource));
+        this.remove(resource);
+      }
+    }
+  }
+  build(e: Entity) {
+    if (e.order.type !== "build") return;
+    const b = this.entities.get(e.order.target);
+    if (!b || b.progress === 1) {
+      this.setOrder(e, { type: "idle" });
+      return;
+    }
+    if (this.gap(e, b) > 0.8) {
+      const p = this.interactPoint(e, b);
+      if (p) this.travel(e, p);
+      return;
+    }
+    const increment = Math.min(1 - b.progress, STEP / SPECS[b.kind].time);
+    b.progress = Math.min(1, b.progress + increment);
+    if (b.progress > 1 - 1e-9) {
+      b.progress = 1;
+      this.record(b.owner, "complete", this.label(b));
+    }
+    b.hp = Math.min(
+      SPECS[b.kind].hp,
+      b.hp + SPECS[b.kind].hp * 0.9 * increment,
+    );
+  }
+  produce(b: Entity) {
+    if (b.progress < 1 || !b.queue.length || b.owner === 2) return;
+    const q = b.queue[0];
+    q.elapsed = Math.min(SPECS[q.kind].time, q.elapsed + STEP);
+    if (q.elapsed + 1e-8 < SPECS[q.kind].time) return;
+    const pop = this.population(b.owner);
+    if (pop.used + SPECS[q.kind].food > pop.cap) return;
+    const h = SPECS[b.kind].size / 2 + 0.8;
+    for (let r = h; r < h + 3; r += 1)
+      for (let i = 0; i < 24; i++) {
+        const angle = (i * Math.PI) / 12,
+          p = { x: b.x + Math.cos(angle) * r, z: b.z + Math.sin(angle) * r };
+        if (
+          !this.nav.canStand(p.x, p.z) ||
+          [...this.entities.values()].some(
+            (e) => isUnit(e.kind) && distance(e, p) < 0.8,
+          )
+        )
+          continue;
+        if (b.rally && !this.nav.path(p, b.rally)) continue;
+        const e = this.spawn(q.kind, b.owner, p.x, p.z);
+        b.queue.shift();
+        this.stats[b.owner].trained++;
+        this.record(b.owner, "born", `${this.label(e)} from ${this.label(b)}`);
+        if (b.rally) this.setOrder(e, { type: "move", point: { ...b.rally } });
+        return;
+      }
+  }
+  snapshot(owner: 0 | 1) {
+    const all = this.own(owner),
+      p = this.players[owner],
+      pop = this.population(owner),
+      count = (f: (e: Entity) => boolean) => all.filter(f).length,
+      workers = all.filter((e) => e.kind === "worker"),
+      job = (type: string, res?: Kind) =>
+        workers.filter(
+          (w) =>
+            w.order.type === type &&
+            (!res ||
+              (w.order.type === "gather" &&
+                this.entities.get(w.order.target)?.kind === res)),
+        ).length;
+    this.record(
+      owner,
+      "snapshot",
+      `gold ${Math.floor(p.gold)} wood ${Math.floor(p.wood)} food ${pop.used}+${pop.reserved}/${pop.cap} ` +
+        `workers ${workers.length} (gold ${job("gather", "gold")} wood ${job("gather", "tree")} build ${job("build")} idle ${job("idle")}) ` +
+        `soldier ${count((e) => e.kind === "soldier")} archer ${count((e) => e.kind === "archer")} ` +
+        `farm ${count((e) => e.kind === "farm")} barracks ${count((e) => e.kind === "barracks")}`,
+    );
+  }
+  // Built-in opponent. Decisions read the live state and track what they have
+  // already ordered this tick, because submitted commands apply next step.
+  ai(owner: 0 | 1) {
+    const enemy = owner === 0 ? 1 : 0,
+      all = this.own(owner),
+      base = all.find((e) => e.kind === "base");
+    if (!base) return;
+    const p = this.players[owner],
+      pop = this.population(owner);
+    let gold = p.gold,
+      wood = p.wood,
+      food = pop.cap - pop.used - pop.reserved;
+    const order = (c: Omit<Command, "player">) =>
+      this.submit({ ...c, player: owner });
+    const buy = (kind: Kind) => {
+      const s = SPECS[kind];
+      if (gold < s.gold || wood < s.wood || (isUnit(kind) && food < s.food))
+        return false;
+      gold -= s.gold;
+      wood -= s.wood;
+      if (isUnit(kind)) food -= s.food;
+      return true;
+    };
+    const nearest = (kind: Kind, from: Point) =>
+      [...this.entities.values()]
+        .filter((e) => e.kind === kind)
+        .sort((a, b) => distance(from, a) - distance(from, b))[0];
+    const job = (w: Entity) =>
+      w.order.type === "gather"
+        ? this.entities.get(w.order.target)?.kind
+        : w.order.type;
+
+    // Economy: saturate the gold mine first, the rest cut wood.
+    const workers = all.filter((e) => e.kind === "worker");
+    let miners = workers.filter((w) => job(w) === "gold").length;
+    const mine = nearest("gold", base);
+    for (const w of workers.filter((e) => e.order.type === "idle")) {
+      const kind = mine && miners < AI.miners ? "gold" : "tree",
+        target = kind === "gold" ? mine : nearest("tree", w);
+      if (!target) continue;
+      if (kind === "gold") miners++;
+      order({ ids: [w.id], type: "gather", target: target.id });
+    }
+    const lumberjacks = workers.filter((w) => job(w) === "tree");
+    if (mine && miners < AI.miners && lumberjacks.length) {
+      order({ ids: [lumberjacks[0].id], type: "gather", target: mine.id });
+      lumberjacks.shift();
+    }
+    const queuedWorkers = base.queue.length;
+    if (
+      workers.length + queuedWorkers < AI.miners + AI.lumberjacks + 1 &&
+      queuedWorkers === 0 &&
+      buy("worker")
+    )
+      order({ ids: [base.id], type: "train", kind: "worker" });
+
+    // Construction: finish abandoned sites, then farms ahead of the food cap.
+    const sites = all.filter((e) => isBuilding(e.kind) && e.progress < 1),
+      builder = () =>
+        lumberjacks.shift() ?? workers.find((w) => job(w) === "gold");
+    for (const site of sites)
+      if (
+        !workers.some(
+          (w) => w.order.type === "build" && w.order.target === site.id,
+        )
+      ) {
+        const w = builder();
+        if (w) order({ ids: [w.id], type: "resume", target: site.id });
+      }
+    const barracks = all.filter((e) => e.kind === "barracks"),
+      farmsPending = sites.filter((e) => e.kind === "farm").length,
+      upcoming = food - SPECS.farm.food * farmsPending;
+    const want: BuildingKind | undefined = !barracks.length
+      ? "barracks"
+      : upcoming < AI.foodBuffer && pop.cap < FOOD_MAX && farmsPending < 2
+        ? "farm"
+        : barracks.length < AI.barracks &&
+            !sites.some((e) => e.kind === "barracks") &&
+            gold > AI.expandGold
+          ? "barracks"
+          : undefined;
+    if (want) {
+      const w = builder();
+      if (w) {
+        const pos = this.aiSite(want, base);
+        if (pos && buy(want))
+          order({ ids: [w.id], type: "build", kind: want, point: pos });
+      }
+    }
+
+    // Production: keep every barracks busy with a footman/archer mix.
+    const army = all.filter((e) => e.kind === "soldier" || e.kind === "archer"),
+      archers = army.filter((e) => e.kind === "archer").length,
+      rally = {
+        x: base.x + Math.sign(SIZE / 2 - base.x) * 10,
+        z: base.z + Math.sign(SIZE / 2 - base.z) * 10,
+      };
+    for (const b of barracks) {
+      if (b.progress < 1) continue;
+      if (!b.rally) order({ ids: [b.id], type: "rally", point: rally });
+      if (b.queue.length >= 2) continue;
+      const kind = archers * 2 < army.length ? "archer" : "soldier";
+      if (buy(kind)) order({ ids: [b.id], type: "train", kind });
+    }
+
+    // Defence uses units near home; a raid only recalls the field army when
+    // it outnumbers the defenders.
+    const raiders = this.own(enemy).filter(
+        (e) => isUnit(e.kind) && distance(e, base) < 20,
+      ),
+      home = army.filter((e) => distance(e, base) < 30),
+      defenders = raiders.length > home.length ? army : home;
+    if (raiders.length) {
+      const free = defenders.filter((e) => e.order.type !== "attack");
+      if (free.length)
+        order({
+          ids: free.map((e) => e.id),
+          type: "attack",
+          target: raiders[0].id,
+        });
+      return;
+    }
+    // Attack in growing groups; once the gold is gone, everything goes.
+    const ready = home.filter((e) => e.order.type !== "assault"),
+      broke = !mine && gold < SPECS.soldier.gold,
+      size = Math.min(
+        AI.waveMax,
+        AI.wave + AI.waveGrowth * this.aiWaves[owner],
+      );
+    if (ready.length && (ready.length >= size || broke)) {
+      const target = this.own(enemy).find((e) => e.kind === "base");
+      if (target) {
+        order({ ids: ready.map((e) => e.id), type: "assault", point: target });
+        this.aiWaves[owner]++;
+        this.record(
+          owner,
+          "wave",
+          `${ready.length} units to ${this.label(target)} (army ${army.length}${broke ? ", all-in" : ""})`,
+        );
+      }
+    }
+  }
+  // First legal spot on rings around the base. Sites are chosen in the blue
+  // player's frame and point-reflected for red, so both sides lay out
+  // identically (snap() rounds .5 upward, which would otherwise differ), and a
+  // one-cell margin keeps AI buildings from sealing pockets that trap workers.
+  aiSite(kind: BuildingKind, base: Entity) {
+    const flip = base.x > SIZE / 2,
+      frame = (p: Point) => (flip ? { x: SIZE - p.x, z: SIZE - p.z } : p),
+      home = frame(base),
+      half = SPECS[kind].size / 2;
+    for (let r = 9; r < 30; r += 4)
+      for (let i = 0; i < 16; i++) {
+        const pos = frame(
+          this.snap(kind, {
+            x: home.x + Math.cos((i * Math.PI) / 8) * r,
+            z: home.z + Math.sin((i * Math.PI) / 8) * r,
+          }),
+        );
+        if (this.placement(kind, pos)) continue;
+        let clear = true;
+        for (let x = pos.x - half - 1; x < pos.x + half + 1 && clear; x++)
+          for (let z = pos.z - half - 1; z < pos.z + half + 1 && clear; z++)
+            if (this.nav.blocked(Math.floor(x), Math.floor(z))) clear = false;
+        if (clear) return pos;
+      }
+    return null;
+  }
+  assertInvariants() {
+    for (const p of this.players)
+      if (p.gold < 0 || p.wood < 0) throw Error("negative resources");
+    for (const e of this.entities.values()) {
+      if (
+        !Number.isFinite(e.x + e.z + e.hp) ||
+        e.carry < 0 ||
+        e.carry > Math.max(GOLD_TRIP, WOOD_TRIP) ||
+        e.amount < 0
+      )
+        throw Error(`invalid entity ${e.id}`);
+      if (isUnit(e.kind) && !this.nav.canStand(e.x, e.z, 0.25))
+        throw Error(`unit in obstacle ${e.id}`);
+    }
+  }
+}

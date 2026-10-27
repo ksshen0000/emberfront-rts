@@ -1,0 +1,73 @@
+{
+  "name": "emberfront-rts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "EMBERFRONT, a Babylon.js real-time strategy prototype",
+  "author": {
+    "name": "EMBERFRONT"
+  },
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "preview": "vite preview --host 0.0.0.0",
+    "test:e2e": "node tests/browser.mjs",
+    "test:logic": "vitest run tests/simulation.test.ts tests/scenarios.test.ts",
+    "test:perf": "vitest run tests/performance.test.ts",
+    "test:camera": "node tests/camera.mjs",
+    "battle": "node scripts/battle.mjs",
+    "test:render": "node tests/render.mjs",
+    "test:mouse": "node tests/mouselock.mjs",
+    "desktop": "npm run build && node scripts/desktop.mjs",
+    "dist:linux": "npm run build && electron-builder --linux AppImage",
+    "test:desktop": "node tests/desktop.mjs",
+    "dist:win": "npm run build && electron-builder --win zip",
+    "test:fog": "node tests/fog.mjs"
+  },
+  "devDependencies": {
+    "@babylonjs/core": "^8.0.0",
+    "@playwright/test": "^1.55.0",
+    "electron": "^44.9.3",
+    "electron-builder": "^26.17.0",
+    "prettier": "^3.9.10",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0",
+    "vitest": "^5.0.5"
+  },
+  "build": {
+    "appId": "dev.emberfront.rts",
+    "productName": "Emberfront",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "build/icon.png",
+      "package.json"
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Game",
+      "icon": "build/icon.png",
+      "artifactName": "Emberfront-${version}-${arch}.AppImage",
+      "syncDesktopName": true,
+      "executableName": "emberfront"
+    },
+    "afterPack": "build/after-pack.cjs",
+    "win": {
+      "target": [
+        "zip"
+      ],
+      "icon": "build/icon.png",
+      "artifactName": "Emberfront-${version}-win-${arch}.zip",
+      "signAndEditExecutable": false
+    }
+  },
+  "desktopName": "emberfront.desktop"
+}
