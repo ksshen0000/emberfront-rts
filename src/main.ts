@@ -1,5 +1,20 @@
 import "./style.css";
-import { World, VISIBLE, EXPLORED, type Entity } from "./simulation/world";
+import {
+  World,
+  VISIBLE,
+  EXPLORED,
+  queueTime,
+  type Entity,
+} from "./simulation/world";
+import {
+  HERO_MAX_LEVEL,
+  HERO_XP,
+  SLAM,
+  heroSpec,
+  reviveCost,
+  slamLevel,
+  specOf,
+} from "./simulation/hero";
 import {
   SPECS,
   STEP,
@@ -200,7 +215,9 @@ const symbols: Record<string, string> = {
   worker: "⚒",
   soldier: "⚔",
   archer: "➶",
+  hero: "♛",
   base: "♜",
+  altar: "✦",
   farm: "⌂",
   barracks: "⚑",
   gold: "◆",
@@ -430,7 +447,7 @@ function showModal() {
     : "EMBERFRONT / EMBERFRONT";
   $("modal-body").innerHTML =
     help && !end
-      ? '<div class="help-grid"><span>Left click / Drag</span><span>Select a unit / Box-select your troops</span><span>Shift + Select</span><span>Add or remove units from selection</span><span>RMB</span><span>Move, attack, gather or resume construction</span><span>A + Click / S</span><span>Attack move / Stop</span><span>Edges / MMB drag</span><span>Pan the camera (also arrows); scroll to zoom</span><span>Double-click</span><span>Select all units of that type on screen</span><span>Space / Minimap</span><span>Focus selection / Click or drag to move camera, right-click to send units</span><span>Alt + Enter</span><span>Toggle fullscreen</span><span>Mouse lock</span><span>Clicking the battlefield confines the cursor to the game; Esc releases it and pauses</span><span>Ctrl + 1–5</span><span>Create control group; number keys recall it</span><span>B / F</span><span>Build barracks / farm with a worker</span><span>Esc</span><span>Cancel targeting / Pause</span></div><p>Select workers and right-click a gold mine or trees. Build a barracks and farms, train an army, then destroy the enemy stronghold in the northeast.</p>'
+      ? '<div class="help-grid"><span>Left click / Drag</span><span>Select a unit / Box-select your troops</span><span>Shift + Select</span><span>Add or remove units from selection</span><span>RMB</span><span>Move, attack, gather or resume construction</span><span>A + Click / S</span><span>Attack move / Stop</span><span>Edges / MMB drag</span><span>Pan the camera (also arrows); scroll to zoom</span><span>Double-click</span><span>Select all units of that type on screen</span><span>Space / Minimap</span><span>Focus selection / Click or drag to move camera, right-click to send units</span><span>Alt + Enter</span><span>Toggle fullscreen</span><span>Mouse lock</span><span>Clicking the battlefield confines the cursor to the game; Esc releases it and pauses</span><span>Ctrl + 1–5</span><span>Create control group; number keys recall it</span><span>B / F / H / V</span><span>Build barracks / farm / stronghold / altar with a worker</span><span>F1</span><span>Select your commander (again to centre on it)</span><span>Q / O</span><span>Commander: cast Quake Slam / learn a rank of it</span><span>Esc</span><span>Cancel targeting / Pause</span></div><p>Select workers and right-click a gold mine or trees. Build a barracks and farms, train an army, then destroy the enemy stronghold in the northeast.</p>'
       : `<p>${end ? `Battle duration: ${formatTime(world.time)}. ${end === "win" ? "The enemy stronghold has been destroyed. The Azure Guard holds the frontier." : "Regroup your forces and challenge the Ember Legion again."}` : "Your troops and production are paused. Resume when you are ready to command."}</p>`;
   $("resume").hidden = !!end;
 }
@@ -513,6 +530,7 @@ window.addEventListener("keydown", (e) => {
       "3",
       "4",
       "5",
+      "f1",
     ].includes(key)
   )
     e.preventDefault();
@@ -538,16 +556,43 @@ window.addEventListener("keydown", (e) => {
     } else select(groups.get(key) ?? []);
     return;
   }
+  if (key === "f1") {
+    // Select the commander; pressing again while selected centres on it.
+    const hero = world.heroOf(0);
+    if (!hero) return;
+    if (selected.size === 1 && selected.has(hero.id)) {
+      view.focus = { x: hero.x, z: hero.z };
+      view.updateCamera();
+    } else select([hero.id]);
+    return;
+  }
+  const commander = selection().find((e) => e.hero);
+  if (commander && (key === "q" || key === "o")) {
+    world.submit({
+      player: 0,
+      ids: [commander.id],
+      type: key === "q" ? "cast" : "learn",
+    });
+    return;
+  }
   if (key === "a") setMode("assault");
   if (key === "s") {
     world.submit({ player: 0, ids: [...selected], type: "stop" });
     setMode("normal");
   }
   if (
-    (key === "b" || key === "f") &&
+    (key === "b" || key === "f" || key === "h" || key === "v") &&
     selection().some((e) => e.kind === "worker")
   )
-    setMode(key === "b" ? "barracks" : "farm");
+    setMode(
+      key === "b"
+        ? "barracks"
+        : key === "f"
+          ? "farm"
+          : key === "v"
+            ? "altar"
+            : "base",
+    );
   if (key === " ") {
     const units = selection();
     if (units.length) {
@@ -663,6 +708,16 @@ function cost(kind: UnitKind | BuildingKind) {
   const s = SPECS[kind];
   return `${s.gold}g${s.wood ? ` · ${s.wood}w` : ""} · ${s.time}s`;
 }
+/** Level, experience, mana and ability readout for a selected commander. */
+function heroDetails(e: Entity) {
+  const h = e.hero!,
+    s = heroSpec(h.level),
+    top = h.level >= HERO_MAX_LEVEL,
+    from = HERO_XP[h.level - 1],
+    to = top ? from : HERO_XP[h.level],
+    xp = top ? 1 : (h.xp - from) / (to - from);
+  return `<div class="health-track mana"><i style="width:${(h.mana / s.mana) * 100}%"></i></div><div class="health-label"><span>Mana</span><span>${Math.floor(h.mana)} / ${s.mana}</span></div><div class="health-track xp"><i style="width:${xp * 100}%"></i></div><div class="health-label"><span>Level ${h.level}${h.points ? ` · ${h.points} skill point${h.points > 1 ? "s" : ""}` : ""}</span><span>${top ? "Max level" : `${Math.floor(h.xp)} / ${to} XP`}</span></div>`;
+}
 function formatTime(t: number) {
   return `${Math.floor(t / 60)
     .toString()
@@ -695,7 +750,58 @@ function updateCursor() {
   if (next !== cursor) canvas.style.cursor = cursor = next;
   drawSoftCursor();
 }
+let heroClick = 0;
+$("hero-card").onclick = () => {
+  const hero = world.heroOf(0),
+    now = performance.now(),
+    twice = now - heroClick < 350;
+  heroClick = now;
+  if (hero) {
+    // A second click in quick succession centres the camera on the hero.
+    if (twice) {
+      view.focus = { x: hero.x, z: hero.z };
+      view.updateCamera();
+    }
+    select([hero.id]);
+    return;
+  }
+  // Fallen or still in training: pick the altar working on it.
+  const altar = world.own(0).find((e) => e.kind === "altar");
+  if (altar) select([altar.id]);
+};
+/** Always-visible commander portrait: health, mana, level and revival. */
+function renderHeroCard() {
+  const card = $("hero-card"),
+    hero = world.heroOf(0),
+    fallen = world.fallen[0],
+    queued = world
+      .own(0)
+      .flatMap((b) => b.queue)
+      .find((q) => q.kind === "hero");
+  card.hidden = !hero && !fallen && !queued;
+  if (card.hidden) return;
+  card.classList.toggle("fallen", !hero);
+  const h = hero?.hero ?? fallen,
+    level = h?.level ?? 1,
+    s = heroSpec(level),
+    [hp, mana] = hero
+      ? [hero.hp / s.hp, h!.mana / s.mana]
+      : queued
+        ? [queued.elapsed / queueTime(queued), 0]
+        : [0, 0];
+  $("hero-level").textContent = String(level);
+  (card.querySelector(".hero-hp > i") as HTMLElement).style.width =
+    `${Math.max(0, hp) * 100}%`;
+  (card.querySelector(".hero-mana > i") as HTMLElement).style.width =
+    `${mana * 100}%`;
+  $("hero-status").textContent = hero
+    ? `${Math.ceil(hero.hp)} / ${s.hp}${h!.points ? " · skill point" : ""}${hero.stun > 0 ? " · stunned" : ""}`
+    : queued
+      ? `${queued.revive ? "Reviving" : "Training"} ${Math.floor(hp * 100)}%`
+      : "Fallen · revive at the altar";
+}
 function renderUI() {
+  renderHeroCard();
   for (const id of selected) if (!world.entities.has(id)) selected.delete(id);
   const p = world.players[0],
     pop = world.population(0);
@@ -712,7 +818,11 @@ function renderUI() {
   const next = units
     .map(
       (e) =>
-        `${e.id}:${Math.floor(e.hp)}:${Math.round(e.progress * 100)}:${e.queue.map((q) => q.kind + Math.floor(q.elapsed)).join(",")}:${e.carry}`,
+        `${e.id}:${Math.floor(e.hp)}:${Math.round(e.progress * 100)}:${e.queue.map((q) => q.kind + Math.floor(q.elapsed)).join(",")}:${e.carry}` +
+        (e.hero
+          ? `:${e.hero.level}:${Math.floor(e.hero.xp)}:${Math.floor(e.hero.mana)}:${e.hero.slam}:${e.hero.points}:${Math.ceil(e.hero.recharge)}`
+          : "") +
+        (e.kind === "altar" ? `:${world.hasHero(0)}:${!!world.fallen[0]}` : ""),
     )
     .join("|");
   if (next !== signature || !$("selection-content").innerHTML) {
@@ -737,15 +847,29 @@ function renderUI() {
         select(
           world
             .own(0)
-            .filter((e) => e.kind === "soldier" || e.kind === "archer")
+            .filter(
+              (e) =>
+                e.kind === "soldier" ||
+                e.kind === "archer" ||
+                e.kind === "hero",
+            )
             .map((e) => e.id),
         ),
       );
+      const commander = world.heroOf(0);
+      if (commander)
+        action(
+          "Commander",
+          "♛",
+          `Level ${commander.hero!.level}`,
+          () => select([commander.id]),
+          "F1",
+        );
     } else {
-      const spec = SPECS[e.kind],
+      const spec = specOf(e),
         hp = Math.max(0, Math.ceil(e.hp));
       $("selection-content").innerHTML =
-        `<div class="portrait">${symbols[e.kind]}</div><div class="unit-details"><h2>${units.length > 1 ? `${units.length} units` : spec.name}</h2><span class="role">Azure Guard · ${isUnit(e.kind) ? (e.kind === "worker" ? "Gatherer & builder" : "Combat unit") : "Settlement"}</span><div class="health-track"><i style="width:${(e.hp / spec.hp) * 100}%"></i></div><div class="health-label"><span>Health</span><span>${hp} / ${spec.hp}</span></div><div class="unit-stats">${isUnit(e.kind) ? `<span>⚔ ${spec.damage!.join("–")} ${spec.attack}</span><span>◎ ${Math.round(spec.range! / WC3)} range</span><span>◈ ${spec.armor} ${spec.armorType}</span>${e.kind === "worker" ? `<span>Carrying ${e.carry}</span>` : ""}` : `<span>◈ ${spec.armor} ${spec.armorType}</span><span>${e.progress < 1 ? `Building ${Math.floor(e.progress * 100)}%` : e.kind === "farm" ? `Food +${-spec.food}` : "Right-click to set a rally point"}</span>`}</div></div>`;
+        `<div class="portrait">${symbols[e.kind]}</div><div class="unit-details"><h2>${units.length > 1 ? `${units.length} units` : spec.name}</h2><span class="role">Azure Guard · ${e.hero ? `Hero · Level ${e.hero.level}` : isUnit(e.kind) ? (e.kind === "worker" ? "Gatherer & builder" : "Combat unit") : "Settlement"}</span><div class="health-track"><i style="width:${(e.hp / spec.hp) * 100}%"></i></div><div class="health-label"><span>Health</span><span>${hp} / ${spec.hp}</span></div>${e.hero && units.length === 1 ? heroDetails(e) : ""}<div class="unit-stats">${isUnit(e.kind) ? `<span>⚔ ${spec.damage!.join("–")} ${spec.attack}</span><span>◎ ${Math.round(spec.range! / WC3)} range</span><span>◈ ${Math.round(spec.armor * 10) / 10} ${spec.armorType}</span>${e.stun > 0 ? "<span>Stunned</span>" : ""}${e.kind === "worker" ? `<span>Carrying ${e.carry}</span>` : ""}` : `<span>◈ ${spec.armor} ${spec.armorType}</span><span>${e.progress < 1 ? `Building ${Math.floor(e.progress * 100)}%` : e.kind === "farm" ? `Food +${-spec.food}` : "Right-click to set a rally point"}</span>`}</div></div>`;
       if (units.some((e) => e.kind === "worker")) {
         action(
           "Barracks",
@@ -755,6 +879,40 @@ function renderUI() {
           "B",
         );
         action("Farm", "⌂", cost("farm"), () => setMode("farm"), "F");
+        action("Stronghold", "♜", cost("base"), () => setMode("base"), "H");
+        action("Altar", "✦", cost("altar"), () => setMode("altar"), "V");
+      }
+      const commander = units.find((u) => u.hero);
+      if (commander) {
+        const h = commander.hero!,
+          next = h.slam + 1,
+          ready = !h.recharge && h.mana >= SLAM.mana && commander.stun <= 0;
+        action(
+          h.slam ? `${SLAM.name} ${h.slam}` : SLAM.name,
+          "✸",
+          !h.slam
+            ? "Not learned"
+            : h.recharge
+              ? `Ready in ${Math.ceil(h.recharge)}s`
+              : `${SLAM.mana} mana · ${SLAM.damage[h.slam - 1]} dmg`,
+          () => world.submit({ player: 0, ids: [commander.id], type: "cast" }),
+          "Q",
+          !h.slam || !ready,
+        );
+        if (h.slam < SLAM.ranks)
+          action(
+            `Learn rank ${next}`,
+            "✚",
+            h.level < slamLevel(next)
+              ? `Needs level ${slamLevel(next)}`
+              : h.points
+                ? `${SLAM.damage[next - 1]} dmg · ${SLAM.stun[next - 1]}s stun`
+                : "No skill points",
+            () =>
+              world.submit({ player: 0, ids: [commander.id], type: "learn" }),
+            "O",
+            !h.points || h.level < slamLevel(next),
+          );
       }
       if (units.some((e) => isUnit(e.kind))) {
         action(
@@ -779,6 +937,29 @@ function renderUI() {
           action("Train soldier", "⚔", cost("soldier"), () => train("soldier"));
           action("Train archer", "➶", cost("archer"), () => train("archer"));
         }
+        if (e.kind === "altar") {
+          const fallen = world.fallen[0],
+            busy = world.hasHero(0) && (!fallen || e.queue.length > 0);
+          if (fallen) {
+            const r = reviveCost(fallen.level);
+            action(
+              "Revive Commander",
+              "♛",
+              `Level ${fallen.level} · ${r.gold}g · ${Math.round(r.time)}s`,
+              () => train("hero"),
+              "",
+              busy,
+            );
+          } else
+            action(
+              "Train Commander",
+              "♛",
+              world.hasHero(0) ? "Already in the field" : cost("hero"),
+              () => train("hero"),
+              "",
+              busy,
+            );
+        }
       }
       if (e.progress < 1)
         action("Cancel build", "×", "75% refund", () =>
@@ -787,7 +968,7 @@ function renderUI() {
       for (const [index, q] of e.queue.entries()) {
         const b = document.createElement("button");
         b.title = "Click to cancel training for a full refund";
-        b.innerHTML = `${symbols[q.kind]} ${SPECS[q.kind].name} ${index === 0 ? `${Math.min(100, Math.floor((q.elapsed / SPECS[q.kind].time) * 100))}%` : "Queued"} ×<i style="width:${(q.elapsed / SPECS[q.kind].time) * 100}%"></i>`;
+        b.innerHTML = `${symbols[q.kind]} ${SPECS[q.kind].name} ${index === 0 ? `${Math.min(100, Math.floor((q.elapsed / queueTime(q)) * 100))}%` : "Queued"} ×<i style="width:${(q.elapsed / queueTime(q)) * 100}%"></i>`;
         b.onclick = () =>
           world.submit({ player: 0, ids: [e.id], type: "cancel", index });
         $("queue").append(b);
@@ -989,7 +1170,7 @@ view.engine.runRenderLoop(() => {
       view.updateCamera();
     }
   }
-  if (mode === "farm" || mode === "barracks") {
+  if (mode !== "normal" && mode !== "assault") {
     const p = view.groundPoint(pointer.x, pointer.y);
     if (p) {
       const pos = world.snap(mode, p);

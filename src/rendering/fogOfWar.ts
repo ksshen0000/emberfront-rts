@@ -39,7 +39,13 @@ export class FogOfWarPlugin extends MaterialPluginBase {
     return shaderType === "fragment"
       ? {
           CUSTOM_FRAGMENT_DEFINITIONS: "uniform sampler2D fogOfWarSampler;",
-          CUSTOM_FRAGMENT_BEFORE_FRAGCOLOR: `color.rgb *= texture2D(fogOfWarSampler, vPositionW.xz / ${SIZE}.0).r;`,
+          // Fog also drains colour, so bright hues (the river's blue) do not
+          // shine through the dark: unexplored ground is grey, explored ground
+          // keeps some colour, and visible ground keeps all of it.
+          CUSTOM_FRAGMENT_BEFORE_FRAGCOLOR: `
+            float fogOfWar = texture2D(fogOfWarSampler, vPositionW.xz / ${SIZE}.0).r;
+            float fogOfWarSat = sqrt(clamp((fogOfWar - ${FOG_UNEXPLORED}) / ${(1 - FOG_UNEXPLORED).toFixed(2)}, 0.0, 1.0));
+            color.rgb = mix(vec3(dot(color.rgb, vec3(0.299, 0.587, 0.114))), color.rgb, fogOfWarSat) * fogOfWar;`,
         }
       : null;
   }

@@ -43,6 +43,7 @@ import {
   type World,
   type Entity,
 } from "../simulation/world";
+import { heroSpec, specOf, SLAM } from "../simulation/hero";
 import {
   FORDS,
   LOWLAND,
@@ -71,6 +72,10 @@ interface View {
   hp: number;
   carry: InstancedMesh | null;
   carryKind: string;
+  /** Hero mana bar fill, under the health bar. */
+  mana: InstancedMesh | null;
+  /** Spinning halo over a stunned unit's head. */
+  stun: InstancedMesh | null;
   /** Footprint half-width, for fog checks after the entity itself is gone. */
   half: number;
   /** Enemy building seen at least once: it stays drawn as last seen while fogged. */
@@ -156,6 +161,10 @@ export class Battlefield {
     grow?: number;
     /** Ground height under a growing effect. */
     y?: number;
+    /** Ring that widens flat along the ground to this scale. */
+    flat?: number;
+    /** Rises this far while fading. */
+    rise?: number;
   }[] = [];
   fx = true;
   constructor(public canvas: HTMLCanvasElement) {
@@ -340,14 +349,16 @@ export class Battlefield {
     // Shaded forest floor under every woodline.
     for (const t of resources)
       if (t.kind === "tree") blob(px(t.x), pz(t.z), 3.2 * k, "#2f42305c");
-    // Worn dirt road: down the east ramp, through the centre ford and up the
-    // enemy's ramp, drawn as a smooth curve in soft layers.
+    // Worn dirt road: down the east ramp, up over the overlook hill by its
+    // two ramps, through the centre ford and on to the enemy's ramp, drawn
+    // as a smooth curve in soft layers.
     const half = [
       { x: 24, z: 24 },
       { x: 33, z: 25 },
-      { x: 44, z: 27.5 },
-      { x: 51, z: 38 },
-      { x: 57, z: 53 },
+      { x: 43, z: 28 },
+      { x: 39, z: 38 },
+      { x: 46, z: 46 },
+      { x: 54, z: 54 },
       FORDS[1],
     ];
     const route = [...half, ...half.slice(0, -1).reverse().map(mirror)];
@@ -431,8 +442,13 @@ export class Battlefield {
             0.85 *
               (1 - smoothstep(0.08, 0.22, Math.abs(h - WATER_LEVEL - 0.08))),
           ],
-          // Plateau tops: sunlit, drier grass.
-          [0.47, 0.53, 0.33, 0.3 * smoothstep(1.2, 1.6, h)],
+          // Hill and plateau tops: sunlit, drier grass, paler the higher.
+          [
+            0.47,
+            0.53,
+            0.33,
+            0.18 * smoothstep(0.75, 1.0, h) + 0.14 * smoothstep(1.3, 1.7, h),
+          ],
           // Ramps: trodden dirt where the slope is walkable.
           [
             0.55,
@@ -737,6 +753,43 @@ export class Battlefield {
     forest.name = "rim-forest";
     scatter(forest, 520, rimTree);
     this.updateCamera();
+    this.prewarm();
+  }
+  /**
+   * Compiles effect shaders up front. A material compiles on first use, and a
+   * half-second effect can end before its shader is ready (or stall a frame).
+   */
+  prewarm() {
+    const probe = MeshBuilder.CreateBox("probe", { size: 0.1 }, this.scene);
+    probe.isPickable = false;
+    probe.setEnabled(false);
+    const once = (
+      [
+        ["slam", "#f0d79a", true],
+        ["levelup", "#ffe08a", true],
+        ["spark", "#ffe1a0", true],
+        ["arrow", "#f3e3b4", true],
+        ["move-mark", "#d0e1ac", true],
+        ["attack-mark", "#ee9b70", true],
+        ["dust", "#b9ad8c", false],
+      ] as const
+    ).map(([name, hex, emissive]) =>
+      this.mat(name, hex, emissive).forceCompilationAsync(probe),
+    );
+    // Overlays are instanced, which compiles a different shader variant.
+    const instanced = (
+      [
+        ["stun", "#ffe08a"],
+        ["mana", "#6f9be0"],
+      ] as const
+    ).map(([name, hex]) =>
+      this.mat(name, hex, true).forceCompilationAsync(probe, {
+        useInstances: true,
+      }),
+    );
+    void Promise.allSettled([...once, ...instanced]).then(() =>
+      probe.dispose(),
+    );
   }
   /** Ground height at a world position, bilinear on the terrain grid. */
   height(x: number, z: number) {
@@ -919,6 +972,15 @@ export class Battlefield {
           torus(0.7, 0.07, 0.4, 0.65, 0, wood).rotation.z = Math.PI / 2;
           cone(0.48, 0.3, 0, 1.26, 0, team);
         }
+        if (e.kind === "hero") {
+          const gold = this.mat("gold", "#e0b65e");
+          // Cape, pauldrons, crown and a two-handed hammer.
+          box(0.52, 0.8, 0.06, 0, 0.6, -0.22, team).rotation.x = 0.15;
+          for (const x of [-0.3, 0.3]) box(0.22, 0.14, 0.4, x, 0.9, 0, gold);
+          cone(0.42, 0.16, 0, 1.3, 0, gold, 0.42, 6);
+          box(0.08, 1.1, 0.08, 0.42, 0.75, 0.12, wood).rotation.z = -0.2;
+          box(0.34, 0.22, 0.22, 0.53, 1.28, 0.12, metal).rotation.z = -0.2;
+        }
       } else if (isBuilding(e.kind)) {
         const s = SPECS[e.kind].size;
         // Deep footing so the building sits flush on gently sloping ground.
@@ -933,6 +995,17 @@ export class Battlefield {
             }
           box(1.25, 1.8, 0.15, 0, 1.1, -2.05, dark);
           box(0.8, 1.5, 0.12, 1.3, 2.7, -2.06, team);
+        } else if (e.kind === "altar") {
+          // Stepped dais with four standing stones around a glowing crystal.
+          box(3.4, 0.5, 3.4, 0, 0.35, 0, stone);
+          box(2.4, 0.5, 2.4, 0, 0.8, 0, stone);
+          for (const x of [-1.4, 1.4])
+            for (const z of [-1.4, 1.4]) {
+              box(0.45, 2.3, 0.45, x, 1.6, z, stone);
+              cone(0.6, 0.5, x, 3, z, team);
+            }
+          cone(0.9, 1.5, 0, 1.8, 0, this.mat("crystal", "#a6e0f0", true), 0, 5);
+          box(1.2, 0.2, 1.2, 0, 1.1, 0, team);
         } else if (e.kind === "barracks") {
           box(4.4, 2.3, 3.6, 0, 1.4, 0, stone);
           cone(6.1, 2, 0, 3.5, 0, team).scaling.z = 0.8;
@@ -987,8 +1060,9 @@ export class Battlefield {
     });
     body.metadata = { id: e.id };
     if (isUnit(e.kind)) {
-      // Slightly oversized figures read better at RTS camera distance.
-      body.scaling.setAll(1.2);
+      // Slightly oversized figures read better at RTS camera distance;
+      // the commander stands a head taller than the troops.
+      body.scaling.setAll(e.kind === "hero" ? 1.55 : 1.2);
       // A team-colored copy that passes the depth test only where
       // something stands in front of the unit, so troops stay visible behind trees.
       const ghost = this.overlay(`ghost-${key}`, body, () => {
@@ -1016,6 +1090,15 @@ export class Battlefield {
     } else if (e.kind === "rock") body.rotation.y = hash(e.id, 4) * Math.PI * 2;
     const neutral = e.owner === 2,
       barWidth = isUnit(e.kind) ? 1.1 : 3;
+    const backPlane = () => {
+      const m = MeshBuilder.CreatePlane(
+        "hp-back",
+        { width: barWidth + 0.08, height: 0.2 },
+        this.scene,
+      );
+      m.material = this.mat("hp-back", "#151b17", true);
+      return m;
+    };
     let ring: InstancedMesh | null = null,
       bar: TransformNode | null = null;
     // Hundreds of trees and mines are never selected and show no health, so
@@ -1040,15 +1123,28 @@ export class Battlefield {
       // Health bars face the fixed camera; the fill shrinks from the left edge.
       bar = new TransformNode("hp", this.scene);
       bar.parent = root;
-      bar.position.y = isUnit(e.kind) ? 2 : e.kind === "base" ? 6.4 : 4.8;
+      bar.position.y =
+        e.kind === "hero"
+          ? 2.55
+          : isUnit(e.kind)
+            ? 2
+            : e.kind === "base"
+              ? 6.4
+              : 4.8;
       bar.rotation.x = Math.PI / 2 - this.camera.beta;
-      this.overlay(`hp-back-${barWidth}`, bar, () => {
+      this.overlay(`hp-back-${barWidth}`, bar, backPlane);
+    }
+    let mana: InstancedMesh | null = null;
+    if (e.kind === "hero" && bar) {
+      const back = this.overlay(`hp-back-${barWidth}`, bar, backPlane);
+      back.position.y = -0.2;
+      mana = this.overlay(`mana-${barWidth}`, bar, () => {
         const m = MeshBuilder.CreatePlane(
-          "hp-back",
-          { width: barWidth + 0.08, height: 0.2 },
+          "mana-fill",
+          { width: barWidth, height: 0.12 },
           this.scene,
         );
-        m.material = this.mat("hp-back", "#151b17", true);
+        m.material = this.mat("mana", "#6f9be0", true);
         return m;
       });
     }
@@ -1069,6 +1165,8 @@ export class Battlefield {
       hp: -1,
       carry: null,
       carryKind: "",
+      mana,
+      stun: null,
       half: isUnit(e.kind) ? 0 : SPECS[e.kind].size / 2,
       remembered: false,
     };
@@ -1227,6 +1325,26 @@ export class Battlefield {
           }
         }
       }
+      if (e.stun > 0 && !v.stun) {
+        v.stun = this.overlay("stun", v.root, () => {
+          const m = MeshBuilder.CreateTorus(
+            "stun",
+            { diameter: 0.55, thickness: 0.08, tessellation: 5 },
+            this.scene,
+          );
+          m.material = this.mat("stun", "#ffe08a", true);
+          m.renderingGroupId = 1;
+          return m;
+        });
+        v.stun.position.y = e.kind === "hero" ? 2.2 : 1.75;
+      } else if (e.stun <= 0 && v.stun) {
+        v.stun.dispose();
+        v.stun = null;
+      }
+      if (v.stun) {
+        v.stun.rotation.y = world.time * 6;
+        v.stun.rotation.x = Math.sin(world.time * 9) * 0.25;
+      }
       if (isUnit(e.kind)) {
         v.body.rotation.y = e.heading;
         v.body.position.y = e.path.length
@@ -1235,10 +1353,19 @@ export class Battlefield {
       } else if (isBuilding(e.kind))
         v.body.scaling.y = 0.15 + e.progress * 0.85;
       v.ring?.setEnabled(this.selection.has(e.id));
+      const max = specOf(e).hp;
       v.bar?.setEnabled(
-        this.selection.has(e.id) || e.hp < SPECS[e.kind].hp || e.progress < 1,
+        this.selection.has(e.id) ||
+          e.hp < max ||
+          e.progress < 1 ||
+          e.kind === "hero",
       );
-      const ratio = Math.max(0.01, e.hp / SPECS[e.kind].hp);
+      if (v.mana && e.hero) {
+        const m = Math.max(0.01, e.hero.mana / heroSpec(e.hero.level).mana);
+        v.mana.scaling.x = m;
+        v.mana.position.set((-(1 - m) * v.barWidth) / 2, -0.2, -0.01);
+      }
+      const ratio = Math.max(0.01, e.hp / max);
       if (v.hp !== ratio) {
         v.hp = ratio;
         const [name, hex] =
@@ -1272,6 +1399,10 @@ export class Battlefield {
         this.effects.length < 80 &&
         (this.sees(world, effect.from) || this.sees(world, effect.to))
       ) {
+        if (effect.burst) {
+          this.burst(effect.burst, effect.to);
+          continue;
+        }
         const from = new Vector3(
             effect.from.x,
             1 + this.height(effect.from.x, effect.from.z),
@@ -1282,6 +1413,15 @@ export class Battlefield {
             0.9 + this.height(effect.to.x, effect.to.z),
             effect.to.z,
           );
+        if (effect.miss) {
+          // A miss sails past the target and sticks in the ground beside it.
+          const dx = effect.to.x - effect.from.x,
+            dz = effect.to.z - effect.from.z,
+            d = Math.hypot(dx, dz) || 1;
+          to.x += (dx / d) * 0.8 + (dz / d) * 0.5;
+          to.z += (dz / d) * 0.8 - (dx / d) * 0.5;
+          to.y = 0.1 + this.height(to.x, to.z);
+        }
         if (effect.ranged) {
           const arrow = MeshBuilder.CreateBox(
             "arrow",
@@ -1336,12 +1476,51 @@ export class Battlefield {
           f.mesh.rotation.set(-climb, Math.atan2(dx, dz), 0);
         }
         f.mesh.position.copyFrom(p);
+      } else if (f.flat) {
+        const k = 0.15 + f.flat * Math.sqrt(t);
+        f.mesh.scaling.set(k, 1, k);
+        f.mesh.visibility = 1 - t;
+      } else if (f.rise) {
+        f.mesh.position.y = (f.y ?? 0) + t * f.rise;
+        f.mesh.visibility = 1 - t * t;
       } else if (f.grow) {
         f.mesh.scaling.setAll(f.grow * (0.4 + t));
         f.mesh.position.y = (f.y ?? 0) + 0.3 + t * f.grow * 0.4;
         f.mesh.visibility = 1 - t;
       } else f.mesh.scaling.setAll(1 - t);
     }
+  }
+  /** Quake Slam shockwave, or the golden halo of a hero gaining a level. */
+  burst(kind: "slam" | "levelup", at: Point) {
+    const y = this.height(at.x, at.z);
+    if (kind === "slam") {
+      // Unit-diameter ring scaled out to the ability's radius.
+      const ring = MeshBuilder.CreateTorus(
+        "slam",
+        { diameter: 1, thickness: 0.12, tessellation: 32 },
+        this.scene,
+      );
+      ring.material = this.mat("slam", "#f0d79a", true);
+      ring.isPickable = false;
+      ring.position.set(at.x, y + 0.15, at.z);
+      this.effects.push({
+        mesh: ring,
+        life: 0.45,
+        max: 0.45,
+        flat: SLAM.radius * 2,
+      });
+      this.puff(new Vector3(at.x, y, at.z), 2.5);
+      return;
+    }
+    const halo = MeshBuilder.CreateTorus(
+      "levelup",
+      { diameter: 1.4, thickness: 0.1, tessellation: 24 },
+      this.scene,
+    );
+    halo.material = this.mat("levelup", "#ffe08a", true);
+    halo.isPickable = false;
+    halo.position.set(at.x, y, at.z);
+    this.effects.push({ mesh: halo, life: 0.5, max: 0.5, rise: 2.6, y });
   }
   puff(at: Vector3, size: number) {
     const mesh = MeshBuilder.CreateSphere(

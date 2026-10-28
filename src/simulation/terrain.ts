@@ -8,12 +8,13 @@ import { SIZE, type Point } from "./config";
 // simulation (blocking, placement) and the renderer (mesh) read the same map.
 
 export const PLATEAU_HEIGHT = 1.6,
+  MID_HEIGHT = 0.8,
   LOWLAND = 0.25,
   WATER_LEVEL = -0.12,
   // Below this the ground is deep water; fords stay above it.
   DEEP_WATER = -0.45,
-  // Height change across one cell beyond which the cell is a cliff face.
-  CLIFF_SLOPE = 0.55;
+  // Steepest walkable slope (rise per unit); ramps stay well below it.
+  MAX_SLOPE = 0.5;
 
 /** Point reflection through the map centre: the other player's side. */
 export const mirror = (p: Point): Point => ({ x: SIZE - p.x, z: SIZE - p.z });
@@ -23,12 +24,44 @@ interface Plateau {
   x: number;
   z: number;
   r: number;
+  /** Rise above the lowland. */
+  h: number;
   ramps: number[];
   phase: number;
 }
+const halfPlateaus: Plateau[] = [
+  // Main base.
+  {
+    x: 24,
+    z: 24,
+    r: 17,
+    h: PLATEAU_HEIGHT,
+    ramps: [8 * deg, 82 * deg],
+    phase: 0,
+  },
+  // Overlook: a low hill astride the road to the centre ford. It splits the
+  // approach into two side gaps and a ramp path over the top, and its crown
+  // sees the ford while lowland units cannot see up onto it.
+  {
+    x: 46,
+    z: 46,
+    r: 5.5,
+    h: MID_HEIGHT,
+    ramps: [225 * deg, 45 * deg],
+    phase: 1,
+  },
+  // Hill expansion: a gold mine on a mid-height shelf with a single ramp
+  // facing home, easy to hold but slow to reinforce.
+  { x: 19, z: 73, r: 7.5, h: MID_HEIGHT, ramps: [290 * deg], phase: 2 },
+];
 export const PLATEAUS: Plateau[] = [
-  { x: 24, z: 24, r: 17, ramps: [8 * deg, 82 * deg], phase: 0 },
-  { x: 104, z: 104, r: 17, ramps: [188 * deg, 262 * deg], phase: Math.PI },
+  ...halfPlateaus,
+  ...halfPlateaus.map((p) => ({
+    ...p,
+    ...mirror(p),
+    ramps: p.ramps.map((a) => a + Math.PI),
+    phase: p.phase + Math.PI,
+  })),
 ];
 // River centreline from the north-west lake to the south-east lake.
 const RIVER_A = { x: 18, z: 110 },
@@ -85,7 +118,8 @@ function plateauLift(x: number, z: number) {
     const dx = x - p.x,
       dz = z - p.z,
       d = Math.hypot(dx, dz);
-    if (d > p.r + 9) continue;
+    const foot = p.r + 1.5 + 3.125 * p.h;
+    if (d > foot + 3) continue;
     const a = Math.atan2(dz, dx),
       // A wobbling rim reads as natural rock rather than a drawn circle.
       r =
@@ -97,12 +131,15 @@ function plateauLift(x: number, z: number) {
       const off = angleDiff(a, ramp);
       if (off > Math.PI / 2) continue;
       const lateral = d * Math.sin(off),
-        side = 1 - smoothstep(2.4, 3.2, lateral);
-      t = Math.max(t, side * smoothstep(r + 6.5, r - 1.5, d));
+        up = smoothstep(foot - p.r + r, r - 1.5, d),
+        // The ramp's walls fade into a gentle flare at its foot instead of
+        // running as low cliffs out into the lowland.
+        side = 1 - smoothstep(2.4, 3.2 + 2.4 * (1 - up), lateral);
+      t = Math.max(t, side * up);
     }
-    lift = Math.max(lift, t);
+    lift = Math.max(lift, t * p.h);
   }
-  return lift * PLATEAU_HEIGHT;
+  return lift;
 }
 
 /** Ground height in world units; 0 is the lowland. */
@@ -144,26 +181,76 @@ export function terrainBlocking() {
   return (blocking ??= computeBlocking());
 }
 function computeBlocking() {
-  // Heights at cell corners, shared between neighbouring cells.
-  const corners = new Float32Array((SIZE + 1) * (SIZE + 1));
-  for (let z = 0; z <= SIZE; z++)
-    for (let x = 0; x <= SIZE; x++)
-      corners[z * (SIZE + 1) + x] = heightAt(x, z);
-  const cells = new Uint8Array(SIZE * SIZE);
+  // Heights on a quarter-cell grid; a cell is a cliff face where the ground
+  // anywhere inside it rises faster than MAX_SLOPE. Judging the steepest
+  // stretch rather than the corner-to-corner drop catches low hills whose
+  // rim falls across a cell boundary.
+  const F = 4,
+    N = SIZE * F + 1,
+    fine = new Float32Array(N * N);
+  for (let j = 0; j < N; j++)
+    for (let i = 0; i < N; i++) fine[j * N + i] = heightAt(i / F, j / F);
+  const cells = new Uint8Array(SIZE * SIZE),
+    limit = MAX_SLOPE / F;
   for (let z = 0; z < SIZE; z++)
     for (let x = 0; x < SIZE; x++) {
-      const hs = [
-        corners[z * (SIZE + 1) + x],
-        corners[z * (SIZE + 1) + x + 1],
-        corners[(z + 1) * (SIZE + 1) + x],
-        corners[(z + 1) * (SIZE + 1) + x + 1],
-        heightAt(x + 0.5, z + 0.5),
-      ];
-      const lo = Math.min(...hs),
-        hi = Math.max(...hs);
-      if (lo < DEEP_WATER || hi - lo > CLIFF_SLOPE) cells[z * SIZE + x] = 1;
+      let lo = Infinity,
+        steep = false;
+      for (let j = z * F; j <= (z + 1) * F && !steep; j++)
+        for (let i = x * F; i <= (x + 1) * F; i++) {
+          const h = fine[j * N + i];
+          lo = Math.min(lo, h);
+          if (
+            (i > x * F && Math.abs(h - fine[j * N + i - 1]) > limit) ||
+            (j > z * F && Math.abs(h - fine[(j - 1) * N + i]) > limit)
+          ) {
+            steep = true;
+            break;
+          }
+        }
+      if (steep || lo < DEEP_WATER) cells[z * SIZE + x] = 1;
     }
   return cells;
+}
+
+/** Height tier of a ground height: 0 lowland (and water), 1 hill, 2 main plateau. */
+export const tierOf = (h: number) =>
+  h > LOWLAND + (MID_HEIGHT + PLATEAU_HEIGHT) / 2
+    ? 2
+    : h > LOWLAND + MID_HEIGHT / 2
+      ? 1
+      : 0;
+let tiers: Uint8Array | null = null;
+/** Height tier per map cell, sampled at the cell centre; computed once. */
+export function terrainTiers() {
+  if (!tiers) {
+    tiers = new Uint8Array(SIZE * SIZE);
+    for (let z = 0; z < SIZE; z++)
+      for (let x = 0; x < SIZE; x++)
+        tiers[z * SIZE + x] = tierOf(heightAt(x + 0.5, z + 0.5));
+  }
+  return tiers;
+}
+/** Height tier under a world position (0 outside the map). */
+export function tierAt(x: number, z: number) {
+  const cx = Math.floor(x),
+    cz = Math.floor(z);
+  return cx < 0 || cz < 0 || cx >= SIZE || cz >= SIZE
+    ? 0
+    : terrainTiers()[cz * SIZE + cx];
+}
+/** Movement speed factor while wading through a ford. */
+export const WADE_SPEED = 0.7;
+let wet: Uint8Array | null = null;
+/** Cells under shallow water, where units wade; computed once. */
+export function terrainWet() {
+  if (!wet) {
+    wet = new Uint8Array(SIZE * SIZE);
+    for (let z = 0; z < SIZE; z++)
+      for (let x = 0; x < SIZE; x++)
+        wet[z * SIZE + x] = heightAt(x + 0.5, z + 0.5) < WATER_LEVEL ? 1 : 0;
+  }
+  return wet;
 }
 
 /** Whether a square footprint is dry and level enough to build on. */
@@ -205,6 +292,7 @@ function computeLayout(): Placement[] {
     { kind: "gold", x: 13, z: 23 }, // main
     { kind: "gold", x: 12, z: 56 }, // natural, below the north ramp
     { kind: "gold", x: 30, z: 84 }, // contested, by the west ford
+    { kind: "gold", x: 15, z: 76 }, // hill expansion
     // Boulders narrowing the centre ford's approach.
     { kind: "rock", x: 52.5, z: 66.5 },
     { kind: "rock", x: 66.5, z: 52.5 },
@@ -214,10 +302,11 @@ function computeLayout(): Placement[] {
     { x: 13, z: 23, r: 4 },
     { x: 12, z: 56, r: 4.5 },
     { x: 30, z: 84, r: 4.5 },
+    { x: 15, z: 76, r: 4.5 },
     ...FORDS.map((f) => ({ ...f, r: 9 })),
   ];
   // Ramp feet stay open so the bases never get sealed by trees.
-  for (const p of PLATEAUS.slice(0, 1))
+  for (const p of halfPlateaus)
     for (const a of p.ramps)
       keepOut.push({
         x: p.x + Math.cos(a) * (p.r + 3),
@@ -238,7 +327,6 @@ function computeLayout(): Placement[] {
     for (const g of [
       { x: 38, z: 60, r: 6.5 },
       { x: 60, z: 38, r: 6.5 },
-      { x: 20, z: 72, r: 5 },
       { x: 72, z: 20, r: 5 },
     ]) {
       const gd = Math.hypot(x - g.x, z - g.z);

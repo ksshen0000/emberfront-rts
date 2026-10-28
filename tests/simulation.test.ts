@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { World, VISIBLE, EXPLORED, type Entity } from "../src/simulation/world";
+import {
+  World,
+  VISIBLE,
+  EXPLORED,
+  UPHILL_MISS,
+  type Entity,
+} from "../src/simulation/world";
 import { Navigation } from "../src/simulation/navigation";
+import { HERO_XP, SLAM, heroSpec, reviveCost } from "../src/simulation/hero";
 import {
   FORDS,
   PLATEAUS,
@@ -8,6 +15,9 @@ import {
   layout,
   mirror,
   riverPoint,
+  terrainWet,
+  tierAt,
+  WADE_SPEED,
 } from "../src/simulation/terrain";
 import {
   STEP,
@@ -249,6 +259,67 @@ describe("AI and long-running simulation", () => {
   }, 20000);
 });
 
+describe("expansions", () => {
+  const natural = (w: World) =>
+    [...w.entities.values()].find(
+      (e) => e.kind === "gold" && distance(e, { x: 12, z: 56 }) < 1,
+    )!;
+  it("keeps a stronghold clear of gold mines", () => {
+    const w = fresh(),
+      mine = natural(w);
+    expect(
+      w.placement("base", w.snap("base", { x: mine.x + 6, z: mine.z })),
+    ).toMatch(/gold mine/);
+    expect(w.placement("base", w.aiExpansion(mine, base(w))!)).toBeNull();
+  });
+  it("a new stronghold takes deliveries from the mine beside it", () => {
+    const w = fresh(),
+      mine = natural(w),
+      main = base(w),
+      spot = w.aiExpansion(mine, main)!;
+    w.players[0].gold = w.players[0].wood = 1000;
+    const builder = w.own(0).find((e) => e.kind === "worker")!;
+    w.submit({
+      player: 0,
+      ids: [builder.id],
+      type: "build",
+      kind: "base",
+      point: spot,
+    });
+    advance(w, 1);
+    const hall = w.own(0).find((e) => e.kind === "base" && e.id !== main.id)!;
+    expect(hall.progress).toBeLessThan(1);
+    advance(w, SPECS.base.time + 30);
+    expect(hall.progress).toBe(1);
+    // A miner at the natural now hauls to the new hall, never to the main.
+    w.submit({ player: 0, ids: [builder.id], type: "gather", target: mine.id });
+    const before = w.players[0].gold;
+    let closest = Infinity;
+    for (let i = 0; i < 60 / STEP; i++) {
+      w.step();
+      closest = Math.min(closest, distance(builder, main));
+    }
+    expect(w.players[0].gold - before).toBeGreaterThanOrEqual(30);
+    expect(closest).toBeGreaterThan(15);
+    w.assertInvariants();
+  }, 20000);
+  it("the AI opens a mirrored expansion in the first ten minutes", () => {
+    const w = new World();
+    w.aiPlayers = [0, 1];
+    for (let i = 0; i < 600 / STEP; i++) {
+      w.step();
+      if (i % 200 === 0) w.assertInvariants();
+    }
+    const halls = (owner: 0 | 1) =>
+      w.own(owner).filter((e) => e.kind === "base" && e.progress === 1);
+    expect(halls(0)).toHaveLength(2);
+    expect(halls(1)).toHaveLength(2);
+    const [a] = halls(0).slice(1),
+      [b] = halls(1).slice(1);
+    expect(mirror(a)).toEqual({ x: b.x, z: b.z });
+  }, 30000);
+});
+
 describe("fog of war", () => {
   const fogAt = (w: World, owner: 0 | 1, x: number, z: number) =>
     w.fogAt(owner, x, z);
@@ -310,11 +381,20 @@ describe("terrain", () => {
     // The walk down never jumps a cliff: consecutive steps change height gently.
     const path = w.nav.path({ x: 28.5, z: 30.5 }, { x: 60, z: 20 })!;
     expect(path).not.toBeNull();
-    let prev = heightAt(28.5, 30.5);
+    // Sample every quarter unit: smoothed paths may skip whole slopes.
+    let from = { x: 28.5, z: 30.5 },
+      prev = heightAt(from.x, from.z);
     for (const q of path) {
-      const h = heightAt(q.x, q.z);
-      expect(Math.abs(h - prev)).toBeLessThan(0.6);
-      prev = h;
+      const n = Math.ceil(Math.hypot(q.x - from.x, q.z - from.z) / 0.25);
+      for (let i = 1; i <= n; i++) {
+        const h = heightAt(
+          from.x + ((q.x - from.x) * i) / n,
+          from.z + ((q.z - from.z) * i) / n,
+        );
+        expect(Math.abs(h - prev)).toBeLessThan(0.2);
+        prev = h;
+      }
+      from = q;
     }
     expect(prev).toBeLessThan(0.6);
   });
@@ -377,7 +457,260 @@ describe("terrain", () => {
         z = (i * 71.9) % 128;
       expect(heightAt(x, z)).toBeCloseTo(heightAt(128 - x, 128 - z), 5);
     }
-    // Each side owns a main, a natural and a contested gold mine.
-    expect(all.filter((p) => p.kind === "gold")).toHaveLength(6);
+    // Each side owns a main, a natural, a hill and a contested gold mine.
+    expect(all.filter((p) => p.kind === "gold")).toHaveLength(8);
   });
+  it("lowland units cannot see up onto higher ground", () => {
+    const w = fresh(),
+      hill = PLATEAUS[1],
+      top = { x: hill.x + 0.5, z: hill.z + 0.5 },
+      below = { x: hill.x + 0.5, z: hill.z - hill.r - 3 };
+    expect(tierAt(top.x, top.z)).toBe(1);
+    expect(tierAt(below.x, below.z)).toBe(0);
+    const scout = w.spawn("soldier", 0, below.x, below.z);
+    w.updateFog();
+    // The hill crown is in range but above the scout; the lowland is not.
+    expect(w.fogAt(0, top.x, top.z) & VISIBLE).toBeFalsy();
+    expect(w.fogAt(0, below.x + 4, below.z) & VISIBLE).toBeTruthy();
+    // From the crown, the lowland below is in plain view.
+    scout.x = top.x;
+    scout.z = top.z;
+    w.updateFog();
+    expect(w.fogAt(0, top.x, top.z) & VISIBLE).toBeTruthy();
+    expect(w.fogAt(0, below.x, below.z) & VISIBLE).toBeTruthy();
+  });
+  it("archers shooting uphill miss about a quarter of their shots", () => {
+    // The same duel on the overlook hill and on flat ground; the farm is an
+    // indestructible target so both archers fire for the whole minute.
+    const duel = (target: { x: number; z: number }) => {
+      const w = fresh(),
+        farm = w.spawn("farm", 1, target.x, target.z),
+        archer = w.spawn("archer", 0, target.x, target.z - 7);
+      farm.hp = 1e9;
+      w.submit({
+        player: 0,
+        ids: [archer.id],
+        type: "attack",
+        target: farm.id,
+      });
+      advance(w, 120);
+      expect(distance(archer, { x: target.x, z: target.z - 7 })).toBeLessThan(
+        0.5,
+      );
+      return 1e9 - farm.hp;
+    };
+    const hill = PLATEAUS[1],
+      uphill = duel({ x: hill.x + 0.5, z: hill.z + 0.5 }),
+      flat = duel({ x: 60.5, z: 27.5 });
+    expect(uphill / flat).toBeGreaterThan(1 - UPHILL_MISS - 0.1);
+    expect(uphill / flat).toBeLessThan(1 - UPHILL_MISS + 0.1);
+  });
+  it("units wade slowly through the fords", () => {
+    const w = fresh(),
+      ford = FORDS[1],
+      wading = w.spawn("soldier", 0, ford.x - 1, ford.z - 1),
+      dry = w.spawn("soldier", 0, 60.5, 20.5);
+    expect(terrainWet()[Math.floor(ford.z) * 128 + Math.floor(ford.x)]).toBe(1);
+    w.submit({
+      player: 0,
+      ids: [wading.id],
+      type: "move",
+      point: { x: ford.x + 2, z: ford.z + 2 },
+    });
+    w.submit({
+      player: 0,
+      ids: [dry.id],
+      type: "move",
+      point: { x: 50.5, z: 20.5 },
+    });
+    advance(w, 1);
+    const waded = distance(wading, { x: ford.x - 1, z: ford.z - 1 }),
+      walked = distance(dry, { x: 60.5, z: 20.5 });
+    expect(waded / walked).toBeCloseTo(WADE_SPEED, 1);
+  });
+});
+
+describe("heroes", () => {
+  // A finished altar beside the blue stronghold, with money and food to spare.
+  const altar = (w: World) => {
+    const a = w.spawn("altar", 0, 36, 20);
+    w.rebuild();
+    w.players[0] = { gold: 5000, wood: 5000 };
+    return a;
+  };
+  const hero = (w: World) => {
+    const h = w.spawn("hero", 0, 64, 40);
+    w.step();
+    return h;
+  };
+  it("trains one commander at the altar", () => {
+    const w = fresh(),
+      a = altar(w);
+    w.submit({ player: 0, ids: [a.id], type: "train", kind: "hero" });
+    w.submit({ player: 0, ids: [a.id], type: "train", kind: "hero" });
+    w.step();
+    expect(a.queue).toHaveLength(1);
+    expect(w.players[0].gold).toBe(5000 - SPECS.hero.gold);
+    expect(w.population(0).reserved).toBe(SPECS.hero.food);
+    advance(w, SPECS.hero.time + 2);
+    const h = w.heroOf(0)!;
+    expect(h.hero).toMatchObject({ level: 1, xp: 0, points: 1, slam: 0 });
+    expect(h.hp).toBe(SPECS.hero.hp);
+    w.submit({ player: 0, ids: [a.id], type: "train", kind: "hero" });
+    w.step();
+    expect(a.queue).toHaveLength(0);
+    // Barracks troops are not available at the altar, nor heroes at barracks.
+    w.submit({ player: 0, ids: [a.id], type: "train", kind: "soldier" });
+    w.step();
+    expect(a.queue).toHaveLength(0);
+  });
+  it("earns experience for nearby kills and grows with each level", () => {
+    const w = fresh(),
+      h = hero(w);
+    const kill = (x: number) => {
+      const v = w.spawn("soldier", 1, x, 40);
+      v.hp = 0;
+      v.lastHit = { id: 999, kind: "archer", owner: 0 };
+      w.step();
+    };
+    kill(66);
+    expect(h.hero!.xp).toBe(40);
+    // Kills beyond the experience range teach the commander nothing.
+    kill(64 + 20);
+    expect(h.hero!.xp).toBe(40);
+    for (let i = 0; i < 4; i++) kill(66);
+    expect(h.hero!.xp).toBe(200);
+    expect(h.hero!.level).toBe(2);
+    expect(h.hero!.points).toBe(2);
+    expect(h.hp).toBeCloseTo(heroSpec(2).hp, 0);
+    h.hero!.xp = HERO_XP[9] - 1;
+    kill(66);
+    expect(h.hero!.level).toBe(10);
+    expect(h.hero!.xp).toBe(HERO_XP[9]);
+  });
+  it("learns ranks at hero levels 1, 3 and 5", () => {
+    const w = fresh(),
+      h = hero(w).hero!;
+    const learn = () => {
+      w.submit({ player: 0, ids: [w.heroOf(0)!.id], type: "learn" });
+      w.step();
+    };
+    learn();
+    expect(h.slam).toBe(1);
+    h.points = 3;
+    h.level = 2;
+    learn();
+    expect(h.slam).toBe(1);
+    h.level = 3;
+    learn();
+    expect(h.slam).toBe(2);
+    learn();
+    expect(h.slam).toBe(2);
+    expect(h.points).toBe(2);
+  });
+  it("Quake Slam damages and stuns enemies around the commander", () => {
+    const w = fresh(),
+      e = hero(w),
+      h = e.hero!;
+    h.slam = 1;
+    h.points = 0;
+    const near = w.spawn("soldier", 1, 65.5, 40),
+      far = w.spawn("soldier", 1, 70, 40),
+      friend = w.spawn("soldier", 0, 63, 40);
+    w.step();
+    const mana = h.mana;
+    w.submit({ player: 0, ids: [e.id], type: "cast" });
+    w.step();
+    expect(h.mana).toBeCloseTo(mana - SLAM.mana, 0);
+    expect(near.hp).toBeLessThanOrEqual(SPECS.soldier.hp - SLAM.damage[0]);
+    expect(near.stun).toBeGreaterThan(SLAM.stun[0] - 0.2);
+    expect(far.hp).toBe(SPECS.soldier.hp);
+    expect(friend.hp).toBe(SPECS.soldier.hp);
+    // A stunned soldier does not strike back.
+    const hp = e.hp;
+    w.setOrder(near, { type: "attack", target: e.id });
+    advance(w, 1);
+    expect(e.hp).toBeGreaterThanOrEqual(hp);
+    // The ability is on cooldown, so the second cast changes nothing.
+    w.submit({ player: 0, ids: [e.id], type: "cast" });
+    w.step();
+    expect(h.mana).toBeGreaterThan(mana - 2 * SLAM.mana);
+  });
+  it("takes half damage from piercing attacks", () => {
+    const w = fresh(),
+      e = hero(w),
+      archer = w.spawn("archer", 1, 70, 40);
+    w.setOrder(e, { type: "idle" });
+    w.setOrder(archer, { type: "attack", target: e.id });
+    const before = e.hp;
+    w.step();
+    w.step();
+    const dealt = before - e.hp,
+      armor = heroSpec(1).armor,
+      cut = 1 - (0.06 * armor) / (1 + 0.06 * armor);
+    expect(dealt).toBeGreaterThanOrEqual(16 * 0.5 * cut - 0.2);
+    expect(dealt).toBeLessThanOrEqual(18 * 0.5 * cut + 0.2);
+  });
+  it("revives a fallen commander at the altar with its level", () => {
+    const w = fresh(),
+      a = altar(w),
+      e = hero(w);
+    e.hero!.level = 4;
+    e.hero!.slam = 2;
+    e.hp = 0;
+    w.step();
+    expect(w.heroOf(0)).toBeUndefined();
+    expect(w.fallen[0]?.level).toBe(4);
+    const gold = w.players[0].gold,
+      cost = reviveCost(4);
+    w.submit({ player: 0, ids: [a.id], type: "train", kind: "hero" });
+    w.step();
+    expect(w.players[0].gold).toBe(gold - cost.gold);
+    // Cancelling refunds the revival price, not the training price.
+    w.submit({ player: 0, ids: [a.id], type: "cancel", index: 0 });
+    w.step();
+    expect(w.players[0].gold).toBe(gold);
+    w.submit({ player: 0, ids: [a.id], type: "train", kind: "hero" });
+    advance(w, cost.time + 2);
+    const back = w.heroOf(0)!;
+    expect(back.hero).toMatchObject({ level: 4, slam: 2 });
+    expect(back.hp).toBe(heroSpec(4).hp);
+    expect(back.hero!.mana).toBe(heroSpec(4).mana);
+    expect(w.fallen[0]).toBeNull();
+    w.assertInvariants();
+  });
+  it("the AI pulls a badly hurt commander home and sends it back healed", () => {
+    const w = fresh(),
+      home = base(w, 1),
+      e = w.spawn("hero", 1, 64, 64),
+      max = heroSpec(1).hp;
+    e.hp = max * 0.25;
+    w.ai(1);
+    w.step();
+    expect(w.aiResting[1]).toBe(true);
+    expect(e.order.type).toBe("move");
+    if (e.order.type === "move")
+      expect(distance(e.order.point, home)).toBeLessThan(10);
+    // Still resting at 40%; rejoins the army from half health.
+    e.hp = max * 0.4;
+    w.ai(1);
+    expect(w.aiResting[1]).toBe(true);
+    e.hp = max * 0.55;
+    w.ai(1);
+    expect(w.aiResting[1]).toBe(false);
+  });
+  it("the AI raises a commander and brings it to battle", () => {
+    const w = new World();
+    w.aiPlayers = [0, 1];
+    w.logging = true;
+    for (let i = 0; i < 480 / STEP; i++) w.step();
+    for (const owner of [0, 1] as const) {
+      expect(w.hasHero(owner)).toBe(true);
+      expect(w.own(owner).some((e) => e.kind === "altar")).toBe(true);
+      const events = w.log.filter((l) => l.owner === owner);
+      expect(events.some((l) => l.event === "learn")).toBe(true);
+      expect(events.some((l) => l.event === "slam")).toBe(true);
+    }
+    w.assertInvariants();
+  }, 30000);
 });

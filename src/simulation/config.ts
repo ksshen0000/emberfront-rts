@@ -2,16 +2,18 @@ export type Kind =
   | "worker"
   | "soldier"
   | "archer"
+  | "hero"
   | "base"
   | "farm"
   | "barracks"
+  | "altar"
   | "gold"
   | "tree"
   | "rock";
-export type UnitKind = "worker" | "soldier" | "archer";
-export type BuildingKind = "farm" | "barracks";
-export type AttackType = "normal" | "pierce";
-export type ArmorType = "medium" | "heavy" | "fortified" | "none";
+export type UnitKind = "worker" | "soldier" | "archer" | "hero";
+export type BuildingKind = "farm" | "barracks" | "base" | "altar";
+export type AttackType = "normal" | "pierce" | "hero";
+export type ArmorType = "medium" | "heavy" | "fortified" | "hero" | "none";
 export interface Spec {
   name: string;
   hp: number;
@@ -29,9 +31,12 @@ export interface Spec {
   cooldown?: number;
   /** Fog-of-war reveal radius in world units, tuned for this 128-unit map. */
   sight?: number;
+  /** WC3 unit level; decides the experience a hero earns for the kill. */
+  level?: number;
 }
 // Stats follow Warcraft III (Reforged): Worker = Peasant, Soldier = Footman,
-// Archer = Night Elf Archer, Stronghold = Town Hall. Distances and speeds are
+// Archer = Night Elf Archer, Commander = a strength hero such as the Paladin,
+// Stronghold = Town Hall, Altar = Altar of Kings. Distances and speeds are
 // given in WC3 units and scaled to world units.
 export const WC3 = 1 / 80;
 const MELEE = 90 * WC3;
@@ -52,6 +57,7 @@ export const SPECS: Record<Kind, Spec> = {
     range: MELEE,
     cooldown: 2,
     sight: 9,
+    level: 1,
   },
   soldier: {
     name: "Soldier",
@@ -69,6 +75,7 @@ export const SPECS: Record<Kind, Spec> = {
     range: MELEE,
     cooldown: 1.35,
     sight: 11,
+    level: 2,
   },
   archer: {
     name: "Archer",
@@ -86,14 +93,34 @@ export const SPECS: Record<Kind, Spec> = {
     range: 500 * WC3,
     cooldown: 1.5,
     sight: 13,
+    level: 2,
+  },
+  // Level 1 figures; heroSpec() in hero.ts grows them with each level.
+  hero: {
+    name: "Commander",
+    hp: 650,
+    size: 0.7,
+    gold: 425,
+    wood: 100,
+    time: 55,
+    food: 5,
+    armor: 4,
+    armorType: "hero",
+    speed: 270 * WC3,
+    damage: [24, 34],
+    attack: "hero",
+    range: MELEE,
+    cooldown: 2.2,
+    sight: 14,
   },
   base: {
     name: "Stronghold",
     hp: 1500,
     size: 6,
-    gold: 0,
-    wood: 0,
-    time: 0,
+    // Town Hall: built by workers to open an expansion and as a drop-off.
+    gold: 385,
+    wood: 205,
+    time: 180,
     food: -12,
     armor: 5,
     armorType: "fortified",
@@ -123,6 +150,18 @@ export const SPECS: Record<Kind, Spec> = {
     armorType: "fortified",
     sight: 10,
   },
+  altar: {
+    name: "Altar",
+    hp: 900,
+    size: 4,
+    gold: 180,
+    wood: 50,
+    time: 60,
+    food: 0,
+    armor: 5,
+    armorType: "fortified",
+    sight: 9,
+  },
   gold: resource("Gold mine", 4),
   tree: resource("Trees", 2),
   rock: resource("Rock", 3),
@@ -142,8 +181,9 @@ function resource(name: string, size: number): Spec {
 }
 // WC3 attack type vs armor type table.
 const MULTIPLIER: Record<AttackType, Record<ArmorType, number>> = {
-  normal: { medium: 1.5, heavy: 1, fortified: 0.7, none: 1 },
-  pierce: { medium: 0.75, heavy: 1, fortified: 0.35, none: 1.5 },
+  normal: { medium: 1.5, heavy: 1, fortified: 0.7, hero: 1, none: 1 },
+  pierce: { medium: 0.75, heavy: 1, fortified: 0.35, hero: 0.5, none: 1.5 },
+  hero: { medium: 1, heavy: 1, fortified: 0.5, hero: 1, none: 1 },
 };
 export const FOOD_MAX = 100,
   START = { gold: 500, wood: 150 },
@@ -173,5 +213,5 @@ export interface Point {
 export const distance = (a: Point, b: Point) =>
   Math.hypot(a.x - b.x, a.z - b.z);
 export const isUnit = (kind: Kind): kind is UnitKind => !!SPECS[kind].speed;
-const BUILDINGS = new Set<Kind>(["base", "farm", "barracks"]);
+const BUILDINGS = new Set<Kind>(["base", "farm", "barracks", "altar"]);
 export const isBuilding = (kind: Kind) => BUILDINGS.has(kind);
