@@ -18,7 +18,7 @@ const page = await browser.newPage({
 const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));
 try {
-  await page.goto("http://127.0.0.1:5173");
+  await page.goto("http://127.0.0.1:5173/?play");
   await page.waitForFunction(() => window.rts?.world);
   await page.waitForTimeout(2000);
   console.log(
@@ -40,7 +40,7 @@ try {
     await page.locator("#selection-content").innerText(),
     /Stronghold/,
   );
-  await page.getByRole("button", { name: "Train worker" }).click();
+  await page.getByRole("button", { name: /Train worker/i }).click();
   // Commands apply on the next simulation step.
   await page.waitForFunction(
     () => window.rts.world.population(0).reserved === 1,
@@ -105,7 +105,7 @@ try {
   );
   await page.mouse.click(barracks.x, barracks.y - 20);
   await page.waitForTimeout(200);
-  await page.getByRole("button", { name: /Train soldier/ }).click();
+  await page.getByRole("button", { name: /Train soldier/i }).click();
   await page.waitForTimeout(100);
   await page.evaluate(() => {
     for (let i = 0; i < 440; i++) window.rts.world.step();

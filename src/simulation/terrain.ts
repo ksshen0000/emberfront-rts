@@ -1,11 +1,9 @@
 import { SIZE, type Point } from "./config";
 
-// "Emerald Marches": two raised main bases on opposite corners, each with two
-// ramps (in the spirit of Warcraft III's Lost Temple and Twisted Meadows), a
-// river between two lakes crossed at three shallow fords, and AoE2-style
-// woodlines that split the lowland into lanes. The map is point-symmetric
-// around its centre so both sides are identical. Heights are analytic, so the
-// simulation (blocking, placement) and the renderer (mesh) read the same map.
+// Maps are point-symmetric around the centre so both sides are identical:
+// each is described for the first player's half and mirrored. Heights are
+// analytic, so the simulation (blocking, placement) and the renderer (mesh)
+// read the same map. Both main bases always sit at (24, 24) and its mirror.
 
 export const PLATEAU_HEIGHT = 1.6,
   MID_HEIGHT = 0.8,
@@ -29,50 +27,191 @@ interface Plateau {
   ramps: number[];
   phase: number;
 }
-const halfPlateaus: Plateau[] = [
-  // Main base.
-  {
-    x: 24,
-    z: 24,
-    r: 17,
-    h: PLATEAU_HEIGHT,
-    ramps: [8 * deg, 82 * deg],
-    phase: 0,
+interface River {
+  a: Point;
+  b: Point;
+  halfWidth: number;
+  meander: number;
+  /** Shallow crossings, as positions along the river (0 = end a). */
+  fords: number[];
+}
+export interface MapDef {
+  id: string;
+  name: string;
+  blurb: string;
+  /** First player's half; mirrored for the other side. */
+  plateaus: Plateau[];
+  river: River | null;
+  /** Full list, already symmetric. */
+  lakes: (Point & { r: number })[];
+  /** Gold mines on the first player's half; [0] is the main base mine. */
+  mines: Point[];
+  rocks: Point[];
+  /** Lane-splitting groves on the first player's half. */
+  groves: (Point & { r: number })[];
+  /** Painted road from the main base to the map centre. */
+  road: Point[];
+}
+// "Emerald Marches": two raised main bases on opposite corners, each with two
+// ramps (in the spirit of Warcraft III's Lost Temple and Twisted Meadows), a
+// river between two lakes crossed at three shallow fords, and AoE2-style
+// woodlines that split the lowland into lanes.
+const EMERALD: MapDef = {
+  id: "emerald",
+  name: "Emerald Marches",
+  blurb:
+    "A river splits the field; three fords, a watch hill and a highland mine.",
+  plateaus: [
+    // Main base.
+    {
+      x: 24,
+      z: 24,
+      r: 17,
+      h: PLATEAU_HEIGHT,
+      ramps: [8 * deg, 82 * deg],
+      phase: 0,
+    },
+    // Overlook: a low hill astride the road to the centre ford. It splits the
+    // approach into two side gaps and a ramp path over the top, and its crown
+    // sees the ford while lowland units cannot see up onto it.
+    {
+      x: 46,
+      z: 46,
+      r: 5.5,
+      h: MID_HEIGHT,
+      ramps: [225 * deg, 45 * deg],
+      phase: 1,
+    },
+    // Hill expansion: a gold mine on a mid-height shelf with a single ramp
+    // facing home, easy to hold but slow to reinforce.
+    { x: 19, z: 73, r: 7.5, h: MID_HEIGHT, ramps: [290 * deg], phase: 2 },
+  ],
+  // River from the north-west lake to the south-east lake.
+  river: {
+    a: { x: 18, z: 110 },
+    b: { x: 110, z: 18 },
+    halfWidth: 4,
+    meander: 3.2,
+    fords: [0.22, 0.5, 0.78],
   },
-  // Overlook: a low hill astride the road to the centre ford. It splits the
-  // approach into two side gaps and a ramp path over the top, and its crown
-  // sees the ford while lowland units cannot see up onto it.
-  {
-    x: 46,
-    z: 46,
-    r: 5.5,
-    h: MID_HEIGHT,
-    ramps: [225 * deg, 45 * deg],
-    phase: 1,
-  },
-  // Hill expansion: a gold mine on a mid-height shelf with a single ramp
-  // facing home, easy to hold but slow to reinforce.
-  { x: 19, z: 73, r: 7.5, h: MID_HEIGHT, ramps: [290 * deg], phase: 2 },
-];
-export const PLATEAUS: Plateau[] = [
-  ...halfPlateaus,
-  ...halfPlateaus.map((p) => ({
+  lakes: [
+    { x: 16, z: 112, r: 10 },
+    { x: 112, z: 16, r: 10 },
+  ],
+  mines: [
+    { x: 13, z: 23 }, // main
+    { x: 12, z: 56 }, // natural, below the north ramp
+    { x: 30, z: 84 }, // contested, by the west ford
+    { x: 15, z: 76 }, // hill expansion
+  ],
+  // Boulders narrowing the centre ford's approach.
+  rocks: [
+    { x: 52.5, z: 66.5 },
+    { x: 66.5, z: 52.5 },
+  ],
+  groves: [
+    { x: 38, z: 60, r: 6.5 },
+    { x: 60, z: 38, r: 6.5 },
+    { x: 72, z: 20, r: 5 },
+  ],
+  // Down the east ramp, over the overlook hill and into the centre ford.
+  road: [
+    { x: 24, z: 24 },
+    { x: 33, z: 25 },
+    { x: 43, z: 28 },
+    { x: 39, z: 38 },
+    { x: 46, z: 46 },
+    { x: 54, z: 54 },
+    { x: 64, z: 64 },
+  ],
+};
+// "Stonewatch Basin": no river; a broad mesa in the middle carries the only
+// shared gold mine and is climbed by four ramps, lakes fill the other two
+// corners, and groves split the flanks into lanes around the mesa.
+const STONEWATCH: MapDef = {
+  id: "stonewatch",
+  name: "Stonewatch Basin",
+  blurb: "Open lowland around a central mesa with a contested gold mine.",
+  plateaus: [
+    {
+      x: 24,
+      z: 24,
+      r: 17,
+      h: PLATEAU_HEIGHT,
+      ramps: [8 * deg, 82 * deg],
+      phase: 0,
+    },
+    // The mesa sits on the centre, so its mirrored twin overlaps it and
+    // contributes the other two ramps.
+    {
+      x: 64,
+      z: 64,
+      r: 11,
+      h: MID_HEIGHT,
+      ramps: [225 * deg, 315 * deg],
+      phase: 0.5,
+    },
+  ],
+  river: null,
+  lakes: [
+    { x: 14, z: 114, r: 14 },
+    { x: 114, z: 14, r: 14 },
+  ],
+  mines: [
+    { x: 13, z: 23 }, // main
+    { x: 12, z: 56 }, // natural below the north ramp
+    { x: 56, z: 12 }, // natural below the east ramp
+    { x: 64, z: 64 }, // contested, on the mesa
+  ],
+  rocks: [
+    { x: 40.5, z: 87.5 },
+    { x: 87.5, z: 40.5 },
+  ],
+  groves: [
+    { x: 36, z: 72, r: 7 },
+    { x: 72, z: 36, r: 7 },
+    { x: 28, z: 100, r: 6 },
+  ],
+  // Down the east ramp and up the mesa's south-west ramp.
+  road: [
+    { x: 24, z: 24 },
+    { x: 33, z: 25 },
+    { x: 43, z: 30 },
+    { x: 48, z: 42 },
+    { x: 54, z: 54 },
+    { x: 64, z: 64 },
+  ],
+};
+export const MAPS: MapDef[] = [EMERALD, STONEWATCH];
+let map = EMERALD;
+const both = (half: Plateau[]) => [
+  ...half,
+  ...half.map((p) => ({
     ...p,
     ...mirror(p),
     ramps: p.ramps.map((a) => a + Math.PI),
     phase: p.phase + Math.PI,
   })),
 ];
-// River centreline from the north-west lake to the south-east lake.
-const RIVER_A = { x: 18, z: 110 },
-  RIVER_B = { x: 110, z: 18 },
-  RIVER_HALF_WIDTH = 4,
-  LAKES = [
-    { x: 16, z: 112, r: 10 },
-    { x: 112, z: 16, r: 10 },
-  ];
-/** Shallow crossings, as positions along the river (0 = north-west end). */
-export const FORDS = [0.22, 0.5, 0.78].map((t) => riverPoint(t));
+export let PLATEAUS: Plateau[] = both(map.plateaus);
+/** Ford centres on the river (empty without one). */
+export let FORDS: Point[] = [];
+// Sampled river centreline for distance queries.
+let RIVER: Point[] = [];
+export const currentMap = () => map;
+/** Switches the terrain to another map and drops every cached grid. */
+export function setMap(id: string) {
+  const next = MAPS.find((m) => m.id === id) ?? EMERALD;
+  if (next === map && FORDS.length === (map.river?.fords.length ?? 0)) return;
+  map = next;
+  PLATEAUS = both(map.plateaus);
+  RIVER = map.river
+    ? Array.from({ length: 97 }, (_, i) => riverPoint(i / 96))
+    : [];
+  FORDS = map.river ? map.river.fords.map((t) => riverPoint(t)) : [];
+  blocking = tiers = wet = null;
+  cachedLayout = null;
+}
 
 const smoothstep = (a: number, b: number, v: number) => {
   const t = Math.max(0, Math.min(1, (v - a) / (b - a)));
@@ -83,20 +222,28 @@ const angleDiff = (a: number, b: number) =>
 
 /** Point on the river centreline; the meander is odd around the middle so the river stays symmetric. */
 export function riverPoint(t: number): Point {
-  const dx = RIVER_B.x - RIVER_A.x,
-    dz = RIVER_B.z - RIVER_A.z,
+  const r = map.river;
+  if (!r) return { x: SIZE / 2, z: SIZE / 2 };
+  const dx = r.b.x - r.a.x,
+    dz = r.b.z - r.a.z,
     len = Math.hypot(dx, dz),
-    meander = 3.2 * Math.sin(2 * Math.PI * 1.5 * (t - 0.5));
+    meander = r.meander * Math.sin(2 * Math.PI * 1.5 * (t - 0.5));
   return {
-    x: RIVER_A.x + dx * t + (-dz / len) * meander,
-    z: RIVER_A.z + dz * t + (dx / len) * meander,
+    x: r.a.x + dx * t + (-dz / len) * meander,
+    z: r.a.z + dz * t + (dx / len) * meander,
   };
 }
-// Sampled centreline for distance queries.
-const RIVER = Array.from({ length: 97 }, (_, i) => riverPoint(i / 96));
 function riverDistance(x: number, z: number) {
-  // The river hugs the anti-diagonal x + z = SIZE; far from it, skip the scan.
-  if (Math.abs(x + z - SIZE) / Math.SQRT2 > 12) return Infinity;
+  const r = map.river;
+  if (!r) return Infinity;
+  // Far from the river's straight axis, skip the scan.
+  const dx = r.b.x - r.a.x,
+    dz = r.b.z - r.a.z;
+  if (
+    Math.abs((x - r.a.x) * dz - (z - r.a.z) * dx) / Math.hypot(dx, dz) >
+    r.halfWidth + r.meander + 5
+  )
+    return Infinity;
   let best = Infinity;
   for (let i = 0; i < RIVER.length - 1; i++) {
     const a = RIVER[i],
@@ -155,12 +302,11 @@ export function heightAt(x: number, z: number) {
     LOWLAND +
     edge * (roll(x, z) + roll(SIZE - x, SIZE - z)) +
     plateauLift(x, z);
-  let water = smoothstep(
-    RIVER_HALF_WIDTH + 1.4,
-    RIVER_HALF_WIDTH - 0.8,
-    riverDistance(x, z),
-  );
-  for (const l of LAKES)
+  const half = map.river?.halfWidth ?? 0;
+  let water = map.river
+    ? smoothstep(half + 1.4, half - 0.8, riverDistance(x, z))
+    : 0;
+  for (const l of map.lakes)
     water = Math.max(
       water,
       smoothstep(l.r + 1.6, l.r - 1, Math.hypot(x - l.x, z - l.z)),
@@ -175,7 +321,9 @@ export function heightAt(x: number, z: number) {
   return h;
 }
 
-let blocking: Uint8Array | null = null;
+let blocking: Uint8Array | null = null,
+  tiers: Uint8Array | null = null,
+  wet: Uint8Array | null = null;
 /** Static blocking per map cell (deep water, cliff faces); computed once. */
 export function terrainBlocking() {
   return (blocking ??= computeBlocking());
@@ -220,7 +368,6 @@ export const tierOf = (h: number) =>
     : h > LOWLAND + MID_HEIGHT / 2
       ? 1
       : 0;
-let tiers: Uint8Array | null = null;
 /** Height tier per map cell, sampled at the cell centre; computed once. */
 export function terrainTiers() {
   if (!tiers) {
@@ -241,7 +388,6 @@ export function tierAt(x: number, z: number) {
 }
 /** Movement speed factor while wading through a ford. */
 export const WADE_SPEED = 0.7;
-let wet: Uint8Array | null = null;
 /** Cells under shallow water, where units wade; computed once. */
 export function terrainWet() {
   if (!wet) {
@@ -284,29 +430,22 @@ export interface Placement {
  * mirrored, so every mine and woodline has an identical twin.
  */
 let cachedLayout: Placement[] | null = null;
+setMap(map.id);
 export function layout(): Placement[] {
   return (cachedLayout ??= computeLayout());
 }
 function computeLayout(): Placement[] {
   const half: Placement[] = [
-    { kind: "gold", x: 13, z: 23 }, // main
-    { kind: "gold", x: 12, z: 56 }, // natural, below the north ramp
-    { kind: "gold", x: 30, z: 84 }, // contested, by the west ford
-    { kind: "gold", x: 15, z: 76 }, // hill expansion
-    // Boulders narrowing the centre ford's approach.
-    { kind: "rock", x: 52.5, z: 66.5 },
-    { kind: "rock", x: 66.5, z: 52.5 },
+    ...map.mines.map((p) => ({ kind: "gold" as const, ...p })),
+    ...map.rocks.map((p) => ({ kind: "rock" as const, ...p })),
   ];
   const keepOut: (Point & { r: number })[] = [
     { x: 24, z: 24, r: 7 }, // stronghold and its spawn ring
-    { x: 13, z: 23, r: 4 },
-    { x: 12, z: 56, r: 4.5 },
-    { x: 30, z: 84, r: 4.5 },
-    { x: 15, z: 76, r: 4.5 },
+    ...map.mines.map((m, i) => ({ ...m, r: i ? 4.5 : 4 })),
     ...FORDS.map((f) => ({ ...f, r: 9 })),
   ];
   // Ramp feet stay open so the bases never get sealed by trees.
-  for (const p of halfPlateaus)
+  for (const p of PLATEAUS)
     for (const a of p.ramps)
       keepOut.push({
         x: p.x + Math.cos(a) * (p.r + 3),
@@ -324,11 +463,7 @@ function computeLayout(): Placement[] {
     if ((x < 7 && z > 44) || (z < 7 && x > 44))
       return 1 - smoothstep(4, 7, Math.min(x < 7 ? x : z, 7));
     // Lane-splitting groves between the ramps and the side fords.
-    for (const g of [
-      { x: 38, z: 60, r: 6.5 },
-      { x: 60, z: 38, r: 6.5 },
-      { x: 72, z: 20, r: 5 },
-    ]) {
+    for (const g of map.groves) {
       const gd = Math.hypot(x - g.x, z - g.z);
       if (gd < g.r) return 1 - smoothstep(g.r - 2, g.r, gd) * 0.7;
     }

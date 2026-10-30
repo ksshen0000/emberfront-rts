@@ -9,14 +9,16 @@ import {
 import {
   HERO_MAX_LEVEL,
   HERO_XP,
-  SLAM,
+  describeAbility,
   heroSpec,
   reviveCost,
-  slamLevel,
+  rankLevel,
   specOf,
 } from "./simulation/hero";
 import {
+  FACTIONS,
   SPECS,
+  type FactionId,
   STEP,
   SIZE,
   WC3,
@@ -27,15 +29,60 @@ import {
   type Point,
 } from "./simulation/config";
 import { Battlefield } from "./rendering/battlefield";
-import { WATER_LEVEL } from "./simulation/terrain";
+import {
+  MAPS,
+  WATER_LEVEL,
+  currentMap,
+  heightAt,
+  layout,
+  mirror,
+  setMap,
+  tierOf,
+} from "./simulation/terrain";
 import { CURSORS, cursorImage } from "./cursors";
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
 // ?spectate hands the blue side to the built-in AI as well (AI vs AI).
-const spectate = new URLSearchParams(location.search).has("spectate");
-function newWorld() {
-  const w = new World();
+const params = new URLSearchParams(location.search),
+  spectate = params.has("spectate");
+// Starting a battle on another map reloads the page (terrain and scenery are
+// built once per page); the choice survives the reload in session storage.
+let launch: { map: string; faction: FactionId; enemy: FactionId } | null = null;
+try {
+  const raw = sessionStorage.getItem("launch");
+  if (raw) {
+    sessionStorage.removeItem("launch");
+    launch = JSON.parse(raw);
+  }
+} catch {
+  /* Storage blocked: the menu simply opens again. */
+}
+let mapChoice = launch?.map ?? params.get("map") ?? storedMap() ?? MAPS[0].id,
+  factionChoice: FactionId = launch?.faction ?? storedFaction("faction"),
+  enemyChoice: FactionId = launch?.enemy ?? storedFaction("enemy"),
+  // ?play (used by the browser tests) and ?spectate skip the menu.
+  menuOpen = !launch && !params.has("play") && !spectate;
+function storedFaction(key: string): FactionId {
+  try {
+    const id = localStorage.getItem(key);
+    if (id && id in FACTIONS) return id as FactionId;
+  } catch {
+    /* Fall back to the default. */
+  }
+  return "crown";
+}
+function storedMap() {
+  try {
+    return localStorage.getItem("map");
+  } catch {
+    return null;
+  }
+}
+function newWorld(map = mapChoice) {
+  const w = new World(map, [factionChoice, enemyChoice]);
   if (spectate) w.aiPlayers = [0, 1];
+  // The menu shows the battlefield frozen behind it.
+  if (menuOpen) w.paused = true;
   return w;
 }
 let world = newWorld();
@@ -241,7 +288,7 @@ function setMode(next: typeof mode) {
     next === "assault"
       ? "Choose an attack destination · Left click to confirm / Esc to cancel"
       : next !== "normal"
-        ? `Place ${SPECS[next].name} · Left click to confirm / Esc to cancel`
+        ? `Place ${world.specFor(next, 0).name} · Left click to confirm / Esc to cancel`
         : "";
   cursorDirty = true;
 }
@@ -428,7 +475,7 @@ canvas.addEventListener(
 function showModal() {
   const end = world.result;
   const m = $("modal");
-  m.hidden = !world.paused && !end;
+  m.hidden = menuOpen || (!world.paused && !end);
   if (!m.hidden && locked) document.exitPointerLock();
   if (m.hidden) return;
   $("modal-title").textContent = end
@@ -447,7 +494,7 @@ function showModal() {
     : "EMBERFRONT / EMBERFRONT";
   $("modal-body").innerHTML =
     help && !end
-      ? '<div class="help-grid"><span>Left click / Drag</span><span>Select a unit / Box-select your troops</span><span>Shift + Select</span><span>Add or remove units from selection</span><span>RMB</span><span>Move, attack, gather or resume construction</span><span>A + Click / S</span><span>Attack move / Stop</span><span>Edges / MMB drag</span><span>Pan the camera (also arrows); scroll to zoom</span><span>Double-click</span><span>Select all units of that type on screen</span><span>Space / Minimap</span><span>Focus selection / Click or drag to move camera, right-click to send units</span><span>Alt + Enter</span><span>Toggle fullscreen</span><span>Mouse lock</span><span>Clicking the battlefield confines the cursor to the game; Esc releases it and pauses</span><span>Ctrl + 1–5</span><span>Create control group; number keys recall it</span><span>B / F / H / V</span><span>Build barracks / farm / stronghold / altar with a worker</span><span>F1</span><span>Select your commander (again to centre on it)</span><span>Q / O</span><span>Commander: cast Quake Slam / learn a rank of it</span><span>Esc</span><span>Cancel targeting / Pause</span></div><p>Select workers and right-click a gold mine or trees. Build a barracks and farms, train an army, then destroy the enemy stronghold in the northeast.</p>'
+      ? '<div class="help-grid"><span>Left click / Drag</span><span>Select a unit / Box-select your troops</span><span>Shift + Select</span><span>Add or remove units from selection</span><span>RMB</span><span>Move, attack, gather or resume construction</span><span>A + Click / S</span><span>Attack move / Stop</span><span>Edges / MMB drag</span><span>Pan the camera (also arrows); scroll to zoom</span><span>Double-click</span><span>Select all units of that type on screen</span><span>Space / Minimap</span><span>Focus selection / Click or drag to move camera, right-click to send units</span><span>Alt + Enter</span><span>Toggle fullscreen</span><span>Mouse lock</span><span>Clicking the battlefield confines the cursor to the game; Esc releases it and pauses</span><span>Ctrl + 1–5</span><span>Create control group; number keys recall it</span><span>B / F / H / V</span><span>Build barracks / farm / stronghold / altar with a worker</span><span>F1</span><span>Select your hero (again to centre on it)</span><span>Q / O</span><span>Hero: cast its ability / learn a rank of it</span><span>Esc</span><span>Cancel targeting / Pause</span></div><p>Select workers and right-click a gold mine or trees. Build a barracks and farms, train an army, then destroy the enemy stronghold in the northeast.</p>'
       : `<p>${end ? `Battle duration: ${formatTime(world.time)}. ${end === "win" ? "The enemy stronghold has been destroyed. The Azure Guard holds the frontier." : "Regroup your forces and challenge the Ember Legion again."}` : "Your troops and production are paused. Resume when you are ready to command."}</p>`;
   $("resume").hidden = !!end;
 }
@@ -472,8 +519,10 @@ $("help").onclick = () => {
   help = true;
   showModal();
 };
-$("restart").onclick = () => {
-  world = newWorld();
+$("restart").onclick = () => restart();
+function restart() {
+  // The scene's terrain was built for this map, so a new battle keeps it.
+  world = newWorld(world.map);
   view.reset();
   selected.clear();
   groups.clear();
@@ -485,8 +534,163 @@ $("restart").onclick = () => {
   accumulator = 0;
   showModal();
   renderUI();
+  labelMap();
   toast("A new battle has begun.");
+}
+$("main-menu").onclick = () => openMenu();
+/** Small overview of a map for its menu card: ground tiers, water, trees, mines and bases. */
+function mapPreview(id: string) {
+  const n = 96,
+    c = document.createElement("canvas");
+  c.width = c.height = n;
+  const g = c.getContext("2d")!,
+    img = g.createImageData(n, n),
+    tiers = ["#4b6a3e", "#6a8551", "#8aa067"];
+  setMap(id);
+  for (let y = 0; y < n; y++)
+    for (let x = 0; x < n; x++) {
+      const h = heightAt(((x + 0.5) / n) * SIZE, (1 - (y + 0.5) / n) * SIZE),
+        hex = h < WATER_LEVEL ? "#2f6f7d" : tiers[tierOf(h)],
+        i = (y * n + x) * 4;
+      img.data[i] = parseInt(hex.slice(1, 3), 16);
+      img.data[i + 1] = parseInt(hex.slice(3, 5), 16);
+      img.data[i + 2] = parseInt(hex.slice(5, 7), 16);
+      img.data[i + 3] = 255;
+    }
+  g.putImageData(img, 0, 0);
+  const at = (p: Point, size: number, color: string) => {
+    g.fillStyle = color;
+    g.fillRect(
+      (p.x / SIZE) * n - size / 2,
+      (1 - p.z / SIZE) * n - size / 2,
+      size,
+      size,
+    );
+  };
+  for (const p of layout())
+    if (p.kind === "tree") at(p, 1.5, "#22392a");
+    else if (p.kind === "gold") at(p, 4, "#e6c06a");
+  at({ x: 24, z: 24 }, 7, "#8fe0d6");
+  at(mirror({ x: 24, z: 24 }), 7, "#f08d6f");
+  // Terrain is shared module state: hand it back to the live world's map.
+  setMap(world.map);
+  return c;
+}
+function menuCard(
+  parent: HTMLElement,
+  chosen: boolean,
+  art: HTMLElement,
+  name: string,
+  blurb: string,
+  pick: () => void,
+) {
+  const b = document.createElement("button");
+  b.className = "menu-card";
+  b.setAttribute("aria-pressed", String(chosen));
+  const text = document.createElement("span");
+  text.innerHTML = `<strong>${name}</strong><small>${blurb}</small>`;
+  b.append(art, text);
+  b.onclick = () => {
+    pick();
+    renderMenu();
+  };
+  parent.append(b);
+}
+let previews: Map<string, HTMLCanvasElement> | null = null;
+function renderMenu() {
+  previews ??= new Map(MAPS.map((m) => [m.id, mapPreview(m.id)]));
+  for (const [box, chosen, pick] of [
+    ["menu-factions", factionChoice, (id: FactionId) => (factionChoice = id)],
+    ["menu-enemy", enemyChoice, (id: FactionId) => (enemyChoice = id)],
+  ] as const) {
+    $(box).replaceChildren();
+    for (const f of Object.values(FACTIONS)) {
+      const crest = document.createElement("span");
+      crest.className = "menu-crest";
+      crest.textContent = f.crest;
+      menuCard($(box), f.id === chosen, crest, f.name, f.blurb, () =>
+        pick(f.id),
+      );
+    }
+  }
+  $("menu-maps").replaceChildren();
+  for (const m of MAPS)
+    menuCard(
+      $("menu-maps"),
+      m.id === mapChoice,
+      previews.get(m.id)!,
+      m.name,
+      m.blurb,
+      () => (mapChoice = m.id),
+    );
+}
+function openMenu() {
+  menuOpen = true;
+  world.paused = true;
+  help = false;
+  keys.clear();
+  setMode("normal");
+  if (locked) document.exitPointerLock();
+  $("menu").hidden = false;
+  renderMenu();
+  showModal();
+}
+$("menu-start").onclick = () => {
+  try {
+    localStorage.setItem("map", mapChoice);
+    localStorage.setItem("faction", factionChoice);
+    localStorage.setItem("enemy", enemyChoice);
+  } catch {
+    /* The choice just won't be remembered. */
+  }
+  if (mapChoice !== world.map) {
+    try {
+      sessionStorage.setItem(
+        "launch",
+        JSON.stringify({
+          map: mapChoice,
+          faction: factionChoice,
+          enemy: enemyChoice,
+        }),
+      );
+      location.reload();
+    } catch {
+      location.search = `?map=${mapChoice}&play`;
+    }
+    return;
+  }
+  menuOpen = false;
+  $("menu").hidden = true;
+  // A battle already under way, or one set up for other factions, is
+  // replaced by a fresh one.
+  if (
+    world.time > 0 ||
+    world.result ||
+    world.factions[0] !== factionChoice ||
+    world.factions[1] !== enemyChoice
+  )
+    restart();
+  world.paused = false;
+  accumulator = 0;
+  showModal();
+  requestLock();
 };
+/** Fills in the battlefield's name wherever the HUD shows it. */
+function labelMap() {
+  const m = currentMap();
+  document.querySelectorAll(".map-name").forEach((el) => {
+    el.textContent = el.classList.contains("upper")
+      ? `THE ${m.name.toUpperCase()}`
+      : m.name;
+  });
+  document.querySelectorAll(".map-blurb").forEach((el) => {
+    el.textContent = m.blurb;
+  });
+  document.querySelectorAll(".matchup").forEach((el) => {
+    el.textContent = `${FACTIONS[world.factions[0]].name} (Azure) vs ${FACTIONS[world.factions[1]].name} (Ember)`;
+  });
+}
+labelMap();
 $("effects").onchange = () => {
   view.fx = $<HTMLInputElement>("effects").checked;
 };
@@ -541,6 +745,7 @@ window.addEventListener("keydown", (e) => {
   }
   // The same Esc press that released the mouse has already been handled.
   if (key === "escape" && performance.now() - lockLostAt < 400) return;
+  if (menuOpen) return;
   if (key === "escape") {
     if (mode !== "normal") setMode("normal");
     else pause();
@@ -675,7 +880,7 @@ $("fullscreen").onclick = () => {
   void setFullscreen(!fullscreen);
 };
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden && !world.result) {
+  if (document.hidden && !world.result && !menuOpen) {
     world.paused = true;
     accumulator = 0;
     keys.clear();
@@ -705,7 +910,7 @@ function train(kind: UnitKind) {
   world.submit({ player: 0, ids: [...selected], type: "train", kind });
 }
 function cost(kind: UnitKind | BuildingKind) {
-  const s = SPECS[kind];
+  const s = world.specFor(kind, 0);
   return `${s.gold}g${s.wood ? ` · ${s.wood}w` : ""} · ${s.time}s`;
 }
 /** Level, experience, mana and ability readout for a selected commander. */
@@ -718,6 +923,8 @@ function heroDetails(e: Entity) {
     xp = top ? 1 : (h.xp - from) / (to - from);
   return `<div class="health-track mana"><i style="width:${(h.mana / s.mana) * 100}%"></i></div><div class="health-label"><span>Mana</span><span>${Math.floor(h.mana)} / ${s.mana}</span></div><div class="health-track xp"><i style="width:${xp * 100}%"></i></div><div class="health-label"><span>Level ${h.level}${h.points ? ` · ${h.points} skill point${h.points > 1 ? "s" : ""}` : ""}</span><span>${top ? "Max level" : `${Math.floor(h.xp)} / ${to} XP`}</span></div>`;
 }
+/** A kind's name in the player's faction. */
+const name = (kind: UnitKind | BuildingKind) => world.specFor(kind, 0).name;
 function formatTime(t: number) {
   return `${Math.floor(t / 60)
     .toString()
@@ -820,7 +1027,7 @@ function renderUI() {
       (e) =>
         `${e.id}:${Math.floor(e.hp)}:${Math.round(e.progress * 100)}:${e.queue.map((q) => q.kind + Math.floor(q.elapsed)).join(",")}:${e.carry}` +
         (e.hero
-          ? `:${e.hero.level}:${Math.floor(e.hero.xp)}:${Math.floor(e.hero.mana)}:${e.hero.slam}:${e.hero.points}:${Math.ceil(e.hero.recharge)}`
+          ? `:${e.hero.level}:${Math.floor(e.hero.xp)}:${Math.floor(e.hero.mana)}:${e.hero.rank}:${e.hero.points}:${Math.ceil(e.hero.recharge)}`
           : "") +
         (e.kind === "altar" ? `:${world.hasHero(0)}:${!!world.fallen[0]}` : ""),
     )
@@ -859,7 +1066,7 @@ function renderUI() {
       const commander = world.heroOf(0);
       if (commander)
         action(
-          "Commander",
+          specOf(commander).name,
           "♛",
           `Level ${commander.hero!.level}`,
           () => select([commander.id]),
@@ -872,46 +1079,47 @@ function renderUI() {
         `<div class="portrait">${symbols[e.kind]}</div><div class="unit-details"><h2>${units.length > 1 ? `${units.length} units` : spec.name}</h2><span class="role">Azure Guard · ${e.hero ? `Hero · Level ${e.hero.level}` : isUnit(e.kind) ? (e.kind === "worker" ? "Gatherer & builder" : "Combat unit") : "Settlement"}</span><div class="health-track"><i style="width:${(e.hp / spec.hp) * 100}%"></i></div><div class="health-label"><span>Health</span><span>${hp} / ${spec.hp}</span></div>${e.hero && units.length === 1 ? heroDetails(e) : ""}<div class="unit-stats">${isUnit(e.kind) ? `<span>⚔ ${spec.damage!.join("–")} ${spec.attack}</span><span>◎ ${Math.round(spec.range! / WC3)} range</span><span>◈ ${Math.round(spec.armor * 10) / 10} ${spec.armorType}</span>${e.stun > 0 ? "<span>Stunned</span>" : ""}${e.kind === "worker" ? `<span>Carrying ${e.carry}</span>` : ""}` : `<span>◈ ${spec.armor} ${spec.armorType}</span><span>${e.progress < 1 ? `Building ${Math.floor(e.progress * 100)}%` : e.kind === "farm" ? `Food +${-spec.food}` : "Right-click to set a rally point"}</span>`}</div></div>`;
       if (units.some((e) => e.kind === "worker")) {
         action(
-          "Barracks",
+          name("barracks"),
           "⚑",
           cost("barracks"),
           () => setMode("barracks"),
           "B",
         );
-        action("Farm", "⌂", cost("farm"), () => setMode("farm"), "F");
-        action("Stronghold", "♜", cost("base"), () => setMode("base"), "H");
-        action("Altar", "✦", cost("altar"), () => setMode("altar"), "V");
+        action(name("farm"), "⌂", cost("farm"), () => setMode("farm"), "F");
+        action(name("base"), "♜", cost("base"), () => setMode("base"), "H");
+        action(name("altar"), "✦", cost("altar"), () => setMode("altar"), "V");
       }
       const commander = units.find((u) => u.hero);
       if (commander) {
         const h = commander.hero!,
-          next = h.slam + 1,
-          ready = !h.recharge && h.mana >= SLAM.mana && commander.stun <= 0;
+          a = world.ability(0),
+          next = h.rank + 1,
+          ready = !h.recharge && h.mana >= a.mana && commander.stun <= 0;
         action(
-          h.slam ? `${SLAM.name} ${h.slam}` : SLAM.name,
+          h.rank ? `${a.name} ${h.rank}` : a.name,
           "✸",
-          !h.slam
+          !h.rank
             ? "Not learned"
             : h.recharge
               ? `Ready in ${Math.ceil(h.recharge)}s`
-              : `${SLAM.mana} mana · ${SLAM.damage[h.slam - 1]} dmg`,
+              : `${a.mana} mana · ${describeAbility(a, h.rank - 1)}`,
           () => world.submit({ player: 0, ids: [commander.id], type: "cast" }),
           "Q",
-          !h.slam || !ready,
+          !h.rank || !ready,
         );
-        if (h.slam < SLAM.ranks)
+        if (h.rank < a.ranks)
           action(
             `Learn rank ${next}`,
             "✚",
-            h.level < slamLevel(next)
-              ? `Needs level ${slamLevel(next)}`
+            h.level < rankLevel(next)
+              ? `Needs level ${rankLevel(next)}`
               : h.points
-                ? `${SLAM.damage[next - 1]} dmg · ${SLAM.stun[next - 1]}s stun`
+                ? describeAbility(a, next - 1)
                 : "No skill points",
             () =>
               world.submit({ player: 0, ids: [commander.id], type: "learn" }),
             "O",
-            !h.points || h.level < slamLevel(next),
+            !h.points || h.level < rankLevel(next),
           );
       }
       if (units.some((e) => isUnit(e.kind))) {
@@ -932,10 +1140,16 @@ function renderUI() {
       }
       if (e.progress === 1 && units.length === 1) {
         if (e.kind === "base")
-          action("Train worker", "⚒", cost("worker"), () => train("worker"));
+          action(`Train ${name("worker")}`, "⚒", cost("worker"), () =>
+            train("worker"),
+          );
         if (e.kind === "barracks") {
-          action("Train soldier", "⚔", cost("soldier"), () => train("soldier"));
-          action("Train archer", "➶", cost("archer"), () => train("archer"));
+          action(`Train ${name("soldier")}`, "⚔", cost("soldier"), () =>
+            train("soldier"),
+          );
+          action(`Train ${name("archer")}`, "➶", cost("archer"), () =>
+            train("archer"),
+          );
         }
         if (e.kind === "altar") {
           const fallen = world.fallen[0],
@@ -943,7 +1157,7 @@ function renderUI() {
           if (fallen) {
             const r = reviveCost(fallen.level);
             action(
-              "Revive Commander",
+              `Revive ${name("hero")}`,
               "♛",
               `Level ${fallen.level} · ${r.gold}g · ${Math.round(r.time)}s`,
               () => train("hero"),
@@ -952,7 +1166,7 @@ function renderUI() {
             );
           } else
             action(
-              "Train Commander",
+              `Train ${name("hero")}`,
               "♛",
               world.hasHero(0) ? "Already in the field" : cost("hero"),
               () => train("hero"),
@@ -968,7 +1182,7 @@ function renderUI() {
       for (const [index, q] of e.queue.entries()) {
         const b = document.createElement("button");
         b.title = "Click to cancel training for a full refund";
-        b.innerHTML = `${symbols[q.kind]} ${SPECS[q.kind].name} ${index === 0 ? `${Math.min(100, Math.floor((q.elapsed / queueTime(q)) * 100))}%` : "Queued"} ×<i style="width:${(q.elapsed / queueTime(q)) * 100}%"></i>`;
+        b.innerHTML = `${symbols[q.kind]} ${name(q.kind)} ${q.blocked ? "Needs food" : index === 0 ? `${Math.min(100, Math.floor((q.elapsed / queueTime(q)) * 100))}%` : "Queued"} ×<i style="width:${(q.elapsed / queueTime(q)) * 100}%"></i>`;
         b.onclick = () =>
           world.submit({ player: 0, ids: [e.id], type: "cancel", index });
         $("queue").append(b);
@@ -1195,7 +1409,9 @@ view.engine.runRenderLoop(() => {
   }
 });
 renderUI();
-toast("Welcome to the frontier. Select workers and right-click a gold mine.");
+if (menuOpen) openMenu();
+else
+  toast("Welcome to the frontier. Select workers and right-click a gold mine.");
 // Local development only: deterministic scenario hooks for browser integration tests.
 if (import.meta.env.DEV)
   (window as unknown as { rts: unknown }).rts = {

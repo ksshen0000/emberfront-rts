@@ -15,6 +15,8 @@ import {
   WOOD_CHOP,
   WOOD_TIME,
   isBuilding,
+  spec as factionSpec,
+  type FactionId,
   type Kind,
   type UnitKind,
   type BuildingKind,
@@ -22,15 +24,16 @@ import {
 } from "./config";
 import { Navigation } from "./navigation";
 import {
-  SLAM,
+  ABILITIES,
+  FRENZY_STRIDE,
   XP_RANGE,
   gainXp,
   heroRegen,
   heroSpec,
   killXp,
   newHero,
+  rankLevel,
   reviveCost,
-  slamLevel,
   specOf,
   type Hero,
 } from "./hero";
@@ -39,6 +42,7 @@ import {
   buildable,
   layout,
   mirror,
+  setMap,
   terrainBlocking,
   terrainTiers,
   terrainWet,
@@ -73,8 +77,10 @@ const AI = {
   waveMax: 16,
   // Gold kept for troops when placing the altar after the first barracks.
   altarReserve: 120,
-  // Enemy units around the hero worth a Quake Slam.
+  // Enemy units around the hero worth a Quake Slam or War Cry.
   slamTargets: 3,
+  // Missing health around the hero, in Verdant Blooms, worth a cast.
+  bloomWaste: 2,
   // A hurt hero falls back home below this share of its health and rejoins
   // the army once it has regenerated past the second.
   heroFlee: 0.3,
@@ -110,20 +116,33 @@ export interface Entity extends Point {
   anchor: Point;
   autoTarget?: number;
   approach?: { target: number; point: Point };
+  /** The resource a worker left to build, resumed once the site stands. */
+  job?: { target: number; kind: "gold" | "tree" };
   lastHit?: { id: number; kind: Kind; owner: Owner };
   /** Seconds left stunned: a stunned unit neither moves nor attacks. */
   stun: number;
+  /** Seconds left frenzied by a War Cry, and its attack-speed bonus. */
+  frenzy: number;
+  frenzyBonus: number;
+  /** The owner's faction (Crownguard for neutral scenery). */
+  faction: FactionId;
   /** Level, experience, mana and abilities; heroes only. */
   hero?: Hero;
 }
 export interface QueueItem {
   kind: UnitKind;
   elapsed: number;
-  /** Reviving a fallen hero, at a price and duration set by its level. */
-  revive?: { gold: number; time: number };
+  /** Duration and price paid, fixed when queued; refunds return the price. */
+  time: number;
+  gold: number;
+  wood: number;
+  /** Reviving a fallen hero rather than training a new one. */
+  revive?: boolean;
+  /** Finished but held back: a farm was lost and food ran short. */
+  blocked?: boolean;
 }
 /** Seconds a queue item takes to finish. */
-export const queueTime = (q: QueueItem) => q.revive?.time ?? SPECS[q.kind].time;
+export const queueTime = (q: QueueItem) => q.time;
 export interface LogEntry {
   t: number;
   owner: Owner;
@@ -171,8 +190,8 @@ export interface Effect {
   ranged: boolean;
   /** The shot missed (fired uphill); the renderer drops it beside the target. */
   miss?: boolean;
-  /** A burst at `to` instead of a shot: a Quake Slam or a hero levelling up. */
-  burst?: "slam" | "levelup";
+  /** A burst at `to` instead of a shot: a hero ability or a level-up. */
+  burst?: "slam" | "cry" | "bloom" | "levelup";
 }
 export class World {
   entities = new Map<number, Entity>();
@@ -214,9 +233,22 @@ export class World {
   // at some point. Simulation rules ignore it; the renderer and minimap read it.
   fog = [new Uint8Array(SIZE * SIZE), new Uint8Array(SIZE * SIZE)];
   fogVersion = 0;
-  constructor() {
+  /** Terrain is shared module state, so a world selects its map on creation. */
+  constructor(
+    public map = "emerald",
+    public factions: [FactionId, FactionId] = ["crown", "crown"],
+  ) {
+    setMap(map);
     this.setup();
     this.updateFog();
+  }
+  /** Stats of a kind as fielded by an owner's faction. */
+  specFor(kind: Kind, owner: Owner) {
+    return factionSpec(kind, owner === 2 ? "crown" : this.factions[owner]);
+  }
+  /** The ability of a player's hero. */
+  ability(owner: 0 | 1) {
+    return ABILITIES[this.factions[owner]];
   }
   updateFog() {
     const tiers = terrainTiers();
@@ -225,7 +257,7 @@ export class World {
       for (let i = 0; i < fog.length; i++) fog[i] &= ~VISIBLE;
       for (const e of this.roster().actors) {
         if (e.owner !== owner) continue;
-        const r = SPECS[e.kind].sight ?? 0,
+        const r = specOf(e).sight ?? 0,
           // Nobody sees up a cliff: ground above the viewer's tier stays dark.
           tier = tiers[Math.floor(e.z) * SIZE + Math.floor(e.x)];
         // Each row of the sight circle is one contiguous run of cells whose
@@ -275,13 +307,14 @@ export class World {
     return false;
   }
   spawn(kind: Kind, owner: Owner, x: number, z: number, complete = true) {
+    const faction = owner === 2 ? "crown" : this.factions[owner];
     const e: Entity = {
       id: this.nextId++,
       kind,
       owner,
       x,
       z,
-      hp: SPECS[kind].hp * (complete ? 1 : 0.1),
+      hp: factionSpec(kind, faction).hp * (complete ? 1 : 0.1),
       progress: complete ? 1 : 0,
       queue: [],
       order: { type: "idle" },
@@ -299,7 +332,10 @@ export class World {
       heading: 0,
       anchor: { x, z },
       stun: 0,
-      hero: kind === "hero" ? newHero() : undefined,
+      frenzy: 0,
+      frenzyBonus: 0,
+      faction,
+      hero: kind === "hero" ? newHero(faction) : undefined,
     };
     this.entities.set(e.id, e);
     return e;
@@ -402,12 +438,17 @@ export class World {
     e.anchor = { x: e.x, z: e.z };
   }
   pay(owner: 0 | 1, kind: Kind) {
-    return this.payCost(owner, SPECS[kind]);
+    return this.payCost(owner, this.specFor(kind, owner));
   }
   payCost(owner: 0 | 1, cost: { gold: number; wood: number }) {
     const p = this.players[owner];
-    if (p.gold < cost.gold || p.wood < cost.wood) {
-      this.notify("Not enough gold or wood.", owner);
+    const gold = p.gold < cost.gold,
+      wood = p.wood < cost.wood;
+    if (gold || wood) {
+      this.notify(
+        `Not enough ${gold && wood ? "gold or wood" : gold ? "gold" : "wood"}.`,
+        owner,
+      );
       return false;
     }
     p.gold -= cost.gold;
@@ -666,13 +707,13 @@ export class World {
         return;
       }
       // A fallen hero is revived with its level instead of trained anew.
-      const revive = fallen ? reviveCost(fallen.level) : undefined;
-      if (
-        revive
-          ? this.payCost(c.player, { gold: revive.gold, wood: 0 })
-          : this.pay(c.player, kind)
-      ) {
-        b.queue.push({ kind, elapsed: 0, revive });
+      const s = this.specFor(kind, c.player),
+        revive = fallen ? reviveCost(fallen.level) : undefined,
+        item: QueueItem = revive
+          ? { kind, elapsed: 0, ...revive, wood: 0, revive: true }
+          : { kind, elapsed: 0, time: s.time, gold: s.gold, wood: s.wood };
+      if (this.payCost(c.player, item)) {
+        b.queue.push(item);
         this.record(
           c.player,
           "queue",
@@ -683,42 +724,43 @@ export class World {
     }
     if (c.type === "learn" || c.type === "cast") {
       const e = units.find((u) => u.hero),
-        h = e?.hero;
+        h = e?.hero,
+        a = this.ability(c.player);
       if (!e || !h) return;
       if (c.type === "learn") {
         if (
           h.points > 0 &&
-          h.slam < SLAM.ranks &&
-          h.level >= slamLevel(h.slam + 1)
+          h.rank < a.ranks &&
+          h.level >= rankLevel(h.rank + 1)
         ) {
           h.points--;
-          h.slam++;
-          this.record(c.player, "learn", `${SLAM.name} ${h.slam}`);
+          h.rank++;
+          this.record(c.player, "learn", `${a.name} ${h.rank}`);
         }
         return;
       }
-      const error = !h.slam
-        ? `${SLAM.name} has not been learned.`
+      const error = !h.rank
+        ? `${a.name} has not been learned.`
         : e.stun > 0
           ? "Your commander is stunned."
           : h.recharge > 0
-            ? `${SLAM.name} is not ready yet.`
-            : h.mana < SLAM.mana
+            ? `${a.name} is not ready yet.`
+            : h.mana < a.mana
               ? "Not enough mana."
               : null;
       if (error) {
         this.notify(error, c.player);
         return;
       }
-      h.mana -= SLAM.mana;
-      h.recharge = SLAM.cooldown;
+      h.mana -= a.mana;
+      h.recharge = a.cooldown;
       this.casting.push(e);
       return;
     }
     if (c.type === "cancel") {
       const b = units[0];
       if (b.progress < 1 && isBuilding(b.kind)) {
-        const s = SPECS[b.kind];
+        const s = this.specFor(b.kind, c.player);
         this.players[c.player].gold += Math.floor(s.gold * 0.75);
         this.players[c.player].wood += Math.floor(s.wood * 0.75);
         this.record(c.player, "cancel", this.label(b));
@@ -727,8 +769,8 @@ export class World {
         const index = c.index ?? 0;
         if (index < 0 || index >= b.queue.length) return;
         const [q] = b.queue.splice(index, 1);
-        this.players[c.player].gold += q.revive?.gold ?? SPECS[q.kind].gold;
-        this.players[c.player].wood += q.revive ? 0 : SPECS[q.kind].wood;
+        this.players[c.player].gold += q.gold;
+        this.players[c.player].wood += q.wood;
       }
       return;
     }
@@ -740,9 +782,23 @@ export class World {
         this.notify(error, c.player);
         return;
       }
-      const candidates = units
-        .filter((e) => e.kind === "worker")
-        .sort((a, b) => distance(a, p) - distance(b, p) || a.id - b.id);
+      // Idle workers first, then gatherers; a worker on another site is only
+      // taken when nobody else was selected, so placing several buildings
+      // with one group never strands a foundation without its builder.
+      const busy = (e: Entity) => {
+          if (e.order.type !== "build") return 0;
+          const site = this.entities.get(e.order.target);
+          return site && site.progress < 1 ? 2 : 0;
+        },
+        rank = (e: Entity) => busy(e) || (e.order.type === "idle" ? 0 : 1),
+        candidates = units
+          .filter((e) => e.kind === "worker")
+          .sort(
+            (a, b) =>
+              rank(a) - rank(b) ||
+              distance(a, p) - distance(b, p) ||
+              a.id - b.id,
+          );
       const mock = { ...candidates[0], ...p, kind } as Entity;
       let worker: Entity | undefined;
       for (const w of candidates) {
@@ -767,6 +823,11 @@ export class World {
         `${this.label(b)} at (${p.x},${p.z}) by ${this.label(worker)}`,
       );
       this.rebuild();
+      const was = worker.order;
+      if (was.type === "gather") {
+        const r = this.entities.get(was.target);
+        if (r) worker.job = { target: r.id, kind: r.kind as "gold" | "tree" };
+      } else if (was.type !== "build") worker.job = undefined;
       this.setOrder(worker, { type: "build", target: b.id });
       return;
     }
@@ -841,7 +902,7 @@ export class World {
       for (const owner of [0, 1] as const) this.snapshot(owner);
     const hits = new Map<number, number>();
     for (const e of this.casting.splice(0))
-      if (this.entities.has(e.id)) this.slam(e, hits);
+      if (this.entities.has(e.id)) this.cast(e, hits);
     for (const e of this.entities.values()) {
       if (e.born === this.tick) continue;
       if (isBuilding(e.kind)) {
@@ -852,12 +913,13 @@ export class World {
       e.cooldown = Math.max(0, e.cooldown - STEP);
       if (e.hero) {
         const h = e.hero,
-          s = heroSpec(h.level),
+          s = heroSpec(h.level, e.faction),
           regen = heroRegen(h.level);
         if (e.hp > 0) e.hp = Math.min(s.hp, e.hp + regen.hp * STEP);
         h.mana = Math.min(s.mana, h.mana + regen.mana * STEP);
         h.recharge = Math.max(0, h.recharge - STEP);
       }
+      e.frenzy = Math.max(0, e.frenzy - STEP);
       if (e.stun > 0) {
         e.stun = Math.max(0, e.stun - STEP);
         continue;
@@ -910,22 +972,23 @@ export class World {
           e.heading = Math.atan2(target.x - e.x, target.z - e.z);
           if (e.cooldown <= 0) {
             // Shots up a cliff miss a quarter of the time.
-            const miss =
-              e.kind === "archer" &&
-              tierAt(target.x, target.z) > tierAt(e.x, e.z) &&
-              this.random() < UPHILL_MISS;
+            const ranged = s.range! > 2,
+              miss =
+                ranged &&
+                tierAt(target.x, target.z) > tierAt(e.x, e.z) &&
+                this.random() < UPHILL_MISS;
             const damage = miss
               ? 0
               : damageAgainst(s, this.random(), specOf(target));
             hits.set(target.id, (hits.get(target.id) ?? 0) + damage);
             target.lastHit = { id: e.id, kind: e.kind, owner: e.owner };
             if (e.owner !== 2) this.stats[e.owner].damage += damage;
-            e.cooldown = s.cooldown!;
+            e.cooldown = s.cooldown! / (e.frenzy > 0 ? 1 + e.frenzyBonus : 1);
             this.effects.push({
               from: { x: e.x, z: e.z },
               to: { x: target.x, z: target.z },
               owner: e.owner,
-              ranged: e.kind === "archer",
+              ranged,
               miss,
             });
           }
@@ -988,33 +1051,45 @@ export class World {
     if (this.effects.length > 200)
       this.effects.splice(0, this.effects.length - 200);
   }
-  /** Quake Slam: damages and stuns every enemy unit around the hero. */
-  slam(e: Entity, hits: Map<number, number>) {
-    const rank = e.hero!.slam - 1,
-      damage = SLAM.damage[rank];
+  /**
+   * A hero ability, centred on the hero: Quake Slam damages and stuns enemy
+   * units, War Cry frenzies friendly units, Verdant Bloom heals them.
+   */
+  cast(e: Entity, hits: Map<number, number>) {
+    if (e.owner === 2) return;
+    const a = this.ability(e.owner),
+      rank = e.hero!.rank - 1,
+      power = a.power[rank],
+      enemy = a.effect === "slam";
     for (const t of this.roster().units) {
-      if (t.owner === e.owner || t.owner === 2) continue;
-      if (distance(e, t) > SLAM.radius + 0.35) continue;
-      hits.set(t.id, (hits.get(t.id) ?? 0) + damage);
-      t.lastHit = { id: e.id, kind: e.kind, owner: e.owner };
-      t.stun = Math.max(t.stun, SLAM.stun[rank] * (t.hero ? 0.5 : 1));
-      if (e.owner !== 2) this.stats[e.owner].damage += damage;
+      if (t.owner === 2 || (t.owner === e.owner) === enemy) continue;
+      if (distance(e, t) > a.radius + 0.35) continue;
+      if (a.effect === "slam") {
+        hits.set(t.id, (hits.get(t.id) ?? 0) + power);
+        t.lastHit = { id: e.id, kind: e.kind, owner: e.owner };
+        t.stun = Math.max(t.stun, a.duration[rank] * (t.hero ? 0.5 : 1));
+        this.stats[e.owner].damage += power;
+      } else if (a.effect === "cry") {
+        // A stronger frenzy still running is kept, not overwritten.
+        t.frenzyBonus = Math.max(t.frenzy > 0 ? t.frenzyBonus : 0, power);
+        t.frenzy = Math.max(t.frenzy, a.duration[rank]);
+      } else if (t.hp > 0) t.hp = Math.min(specOf(t).hp, t.hp + power);
     }
-    this.record(e.owner, "slam", `${this.label(e)} rank ${rank + 1}`);
+    this.record(e.owner, "cast", `${this.label(e)} ${a.name} ${rank + 1}`);
     this.effects.push({
       from: { x: e.x, z: e.z },
       to: { x: e.x, z: e.z },
       owner: e.owner,
       ranged: false,
-      burst: "slam",
+      burst: a.effect,
     });
   }
   /** Grants experience; each level raises health along with the maximum. */
   reward(e: Entity, xp: number) {
     const h = e.hero!,
-      before = heroSpec(h.level);
+      before = heroSpec(h.level, e.faction);
     if (!gainXp(h, xp)) return;
-    const after = heroSpec(h.level);
+    const after = heroSpec(h.level, e.faction);
     e.hp += after.hp - before.hp;
     h.mana += after.mana - before.mana;
     this.record(e.owner, "level", `${this.label(e)} reached level ${h.level}`);
@@ -1051,7 +1126,11 @@ export class World {
     if (!point) return false;
     const d = distance(e, point),
       wade = terrainWet()[Math.floor(e.z) * SIZE + Math.floor(e.x)],
-      step = Math.min(SPECS[e.kind].speed! * STEP * (wade ? WADE_SPEED : 1), d);
+      haste = e.frenzy > 0 ? 1 + e.frenzyBonus * FRENZY_STRIDE : 1,
+      step = Math.min(
+        specOf(e).speed! * STEP * haste * (wade ? WADE_SPEED : 1),
+        d,
+      );
     if (d < 0.12) {
       e.path.shift();
       return !e.path.length && distance(e, goal) < 0.8;
@@ -1116,6 +1195,8 @@ export class World {
       "stuck",
       `${this.label(e)} at (${e.x.toFixed(1)},${e.z.toFixed(1)}) order ${e.order.type} try ${e.failures}`,
     );
+    const r = e.order.type === "gather" && this.entities.get(e.order.target);
+    if (r && e.failures >= 2 && this.regather(e, r)) return;
     if (e.failures >= 3) {
       this.notify(
         "Some units cannot reach their destination. Try a different route.",
@@ -1123,6 +1204,16 @@ export class World {
       );
       this.setOrder(e, { type: "idle" });
     }
+  }
+  // A tree deep in the forest has no free side; clicks easily land on one
+  // behind the treeline. The worker takes the nearest reachable tree instead
+  // of standing still or giving up.
+  regather(e: Entity, resource: Entity) {
+    if (resource.kind !== "tree") return false;
+    const next = this.nearestResource(e, "tree", resource.id);
+    if (!next) return false;
+    this.setOrder(e, { type: "gather", target: next.id });
+    return true;
   }
   gather(e: Entity) {
     if (e.order.type !== "gather") return;
@@ -1165,6 +1256,7 @@ export class World {
     if (this.gap(e, resource) > 0.6) {
       const p = this.interactPoint(e, resource);
       if (p) this.travel(e, p);
+      else this.regather(e, resource);
       return;
     }
     e.path = [];
@@ -1191,7 +1283,7 @@ export class World {
     if (e.order.type !== "build") return;
     const b = this.entities.get(e.order.target);
     if (!b || b.progress === 1) {
-      this.setOrder(e, { type: "idle" });
+      this.backToWork(e);
       return;
     }
     if (this.gap(e, b) > 0.8) {
@@ -1199,16 +1291,37 @@ export class World {
       if (p) this.travel(e, p);
       return;
     }
-    const increment = Math.min(1 - b.progress, STEP / SPECS[b.kind].time);
+    const s = this.specFor(b.kind, b.owner),
+      increment = Math.min(1 - b.progress, STEP / s.time);
     b.progress = Math.min(1, b.progress + increment);
+    b.hp = Math.min(s.hp, b.hp + s.hp * 0.9 * increment);
     if (b.progress > 1 - 1e-9) {
       b.progress = 1;
       this.record(b.owner, "complete", this.label(b));
+      this.backToWork(e);
     }
-    b.hp = Math.min(
-      SPECS[b.kind].hp,
-      b.hp + SPECS[b.kind].hp * 0.9 * increment,
-    );
+  }
+  /** A builder goes back to the mine or wood it left, or the nearest like it.
+   * AI builders go idle instead: the AI rebalances its idle workers itself. */
+  backToWork(e: Entity) {
+    const job = this.aiPlayers.includes(e.owner as 0 | 1) ? undefined : e.job;
+    e.job = undefined;
+    const r =
+      (job && this.entities.get(job.target)) ??
+      (job && this.nearestResource(e, job.kind));
+    this.setOrder(e, r ? { type: "gather", target: r.id } : { type: "idle" });
+  }
+  /** The closest resource of a kind the worker can reach, skipping one. */
+  nearestResource(e: Entity, kind: "gold" | "tree", skip?: number) {
+    const near = [...this.entities.values()]
+      .filter((r) => r.kind === kind && r.id !== skip)
+      .sort((a, b) => distance(e, a) - distance(e, b) || a.id - b.id);
+    // Path checks are costly: try the few nearest only.
+    for (const r of near.slice(0, 8)) {
+      const p = this.interactPoint(e, r);
+      if (p && this.nav.path(e, p)) return r;
+    }
+    return undefined;
   }
   produce(b: Entity) {
     if (b.progress < 1 || !b.queue.length || b.owner === 2) return;
@@ -1216,7 +1329,15 @@ export class World {
     q.elapsed = Math.min(queueTime(q), q.elapsed + STEP);
     if (q.elapsed + 1e-8 < queueTime(q)) return;
     const pop = this.population(b.owner);
-    if (pop.used + SPECS[q.kind].food > pop.cap) return;
+    if (pop.used + SPECS[q.kind].food > pop.cap) {
+      if (!q.blocked)
+        this.tell(
+          `${this.specFor(q.kind, b.owner).name} is waiting for food. Build more farms.`,
+          b.owner,
+        );
+      q.blocked = true;
+      return;
+    }
     const h = SPECS[b.kind].size / 2 + 0.8;
     for (let r = h; r < h + 3; r += 1)
       for (let i = 0; i < 24; i++) {
@@ -1232,7 +1353,7 @@ export class World {
           fallen = q.revive ? this.fallen[b.owner] : null;
         if (fallen) {
           // Revived at full health and mana, keeping level and abilities.
-          const s = heroSpec(fallen.level);
+          const s = heroSpec(fallen.level, e.faction);
           e.hero = { ...fallen, mana: s.mana, recharge: 0 };
           e.hp = s.hp;
           this.fallen[b.owner] = null;
@@ -1282,7 +1403,7 @@ export class World {
     const order = (c: Omit<Command, "player">) =>
       this.submit({ ...c, player: owner });
     const buy = (kind: Kind) => {
-      const s = SPECS[kind];
+      const s = this.specFor(kind, owner);
       if (gold < s.gold || wood < s.wood || (isUnit(kind) && food < s.food))
         return false;
       gold -= s.gold;
@@ -1369,7 +1490,7 @@ export class World {
       ? "barracks"
       : upcoming < AI.foodBuffer && pop.cap < FOOD_MAX && farmsPending < 2
         ? "farm"
-        : !altar && gold > SPECS.altar.gold + AI.altarReserve
+        : !altar && gold > this.specFor("altar", owner).gold + AI.altarReserve
           ? "altar"
           : barracks.length < AI.barracks * Math.max(1, halls.length) &&
               !sites.some((e) => e.kind === "barracks") &&
@@ -1438,18 +1559,28 @@ export class World {
       }
     }
     if (hero?.hero) {
-      const h = hero.hero;
-      if (h.points && h.slam < SLAM.ranks && h.level >= slamLevel(h.slam + 1))
+      const h = hero.hero,
+        a = this.ability(owner);
+      if (h.points && h.rank < a.ranks && h.level >= rankLevel(h.rank + 1))
         order({ ids: [hero.id], type: "learn" });
-      if (
-        h.slam &&
-        !h.recharge &&
-        !hero.stun &&
-        h.mana >= SLAM.mana &&
-        this.roster().units.filter(
-          (t) => t.owner === enemy && distance(t, hero) <= SLAM.radius,
-        ).length >= AI.slamTargets
-      )
+      // Slam and cry when a fight is on around the hero; bloom when the
+      // troops around it have lost enough health to use the whole heal.
+      const near = (side: Owner, r: number) =>
+          this.roster().units.filter(
+            (t) => t.owner === side && distance(t, hero) <= r,
+          ),
+        worth =
+          a.effect === "bloom"
+            ? near(owner, a.radius).reduce(
+                (n, t) => n + specOf(t).hp - t.hp,
+                0,
+              ) >=
+              a.power[h.rank - 1] * AI.bloomWaste
+            : near(enemy, a.effect === "slam" ? a.radius : a.radius * 0.8)
+                .length >= AI.slamTargets &&
+              (a.effect === "slam" ||
+                near(owner, a.radius).length >= AI.slamTargets);
+      if (h.rank && !h.recharge && !hero.stun && h.mana >= a.mana && worth)
         order({ ids: [hero.id], type: "cast" });
       // Losing the hero costs its revival and its experience lead, so a
       // badly hurt one retreats behind the stronghold and recovers.
@@ -1508,7 +1639,7 @@ export class World {
     }
     // Attack in growing groups; once the gold is gone, everything goes.
     const ready = home.filter((e) => e.order.type !== "assault"),
-      broke = !mine && gold < SPECS.soldier.gold,
+      broke = !mine && gold < this.specFor("soldier", owner).gold,
       size = Math.min(
         AI.waveMax,
         AI.wave + AI.waveGrowth * this.aiWaves[owner],

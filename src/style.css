@@ -703,6 +703,110 @@ kbd {
 .primary:hover {
   background: #c3d3a7;
 }
+.menu-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: radial-gradient(ellipse at center, #0d1a12b0, #070d09f0);
+  backdrop-filter: blur(3px);
+  overflow-y: auto;
+}
+.menu-backdrop[hidden] {
+  display: none;
+}
+.menu {
+  width: min(760px, 100%);
+  padding: 34px 38px 30px;
+  background: #1a271fef;
+  border: 1px solid #81936b;
+  border-top: 2px solid var(--gold);
+  box-shadow: 0 30px 100px #0008;
+}
+.menu h1 {
+  font-size: 30px;
+  font-weight: 400;
+  letter-spacing: 3px;
+  margin: 12px 0 6px;
+}
+.menu-lead {
+  margin: 0 0 22px;
+  font-size: 12px;
+  color: #aabca2;
+}
+.menu h3 {
+  margin: 20px 0 10px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+.menu-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+.menu-card {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 10px;
+  text-align: left;
+  background: #202e25;
+}
+.menu-card[aria-pressed="true"] {
+  border-color: var(--gold);
+  background: #2c3b2d;
+  box-shadow: inset 0 0 0 1px #cab17c55;
+}
+.menu-card:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.menu-card strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 3px;
+}
+.menu-card small {
+  display: block;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #9fb197;
+}
+.menu-crest {
+  flex: none;
+  width: 54px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  font-size: 26px;
+  background: #0f1712;
+  border: 1px solid #b3c18e40;
+}
+.menu-card canvas {
+  flex: none;
+  width: 84px;
+  height: 84px;
+  border: 1px solid #b3c18e40;
+}
+.menu-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 26px;
+}
+.menu-actions button {
+  padding: 12px 28px;
+}
+@media (max-width: 520px) {
+  .menu {
+    padding: 24px 18px;
+  }
+}
 .fx-toggle {
   display: block;
   font-size: 11px;
@@ -842,4 +946,9 @@ body.confined #soft-cursor {
 button.soft-hover:not(:disabled) {
   background: #354437;
   border-color: #9fba8c;
+}
+b.map-name,
+b.map-blurb,
+b.matchup {
+  font-weight: inherit;
 }

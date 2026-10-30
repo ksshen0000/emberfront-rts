@@ -38,7 +38,7 @@ const shown = (id) =>
     return v ? v.root.isEnabled() : null;
   }, id);
 try {
-  await page.goto("http://127.0.0.1:5173");
+  await page.goto("http://127.0.0.1:5173/?play");
   await page.waitForFunction(() => window.rts?.view);
   await frames();
   const start = await page.evaluate(() => {

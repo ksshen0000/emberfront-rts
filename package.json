@@ -24,7 +24,8 @@
     "dist:linux": "npm run build && electron-builder --linux AppImage",
     "test:desktop": "node tests/desktop.mjs",
     "dist:win": "npm run build && electron-builder --win zip",
-    "test:fog": "node tests/fog.mjs"
+    "test:fog": "node tests/fog.mjs",
+    "test:menu": "node tests/menu.mjs"
   },
   "devDependencies": {
     "@babylonjs/core": "^8.0.0",

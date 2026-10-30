@@ -215,3 +215,121 @@ export const distance = (a: Point, b: Point) =>
 export const isUnit = (kind: Kind): kind is UnitKind => !!SPECS[kind].speed;
 const BUILDINGS = new Set<Kind>(["base", "farm", "barracks", "altar"]);
 export const isBuilding = (kind: Kind) => BUILDINGS.has(kind);
+// Factions share one tech layout (worker, melee, ranged and hero; hall, food
+// building, barracks and altar), so every rule and the AI work for all of
+// them. Each overrides names, stats and costs on top of the Crownguard values
+// above. Footprints and food stay common so placement and supply match.
+export type FactionId = "crown" | "orc" | "elf";
+export interface Faction {
+  id: FactionId;
+  name: string;
+  crest: string;
+  blurb: string;
+  specs: Partial<Record<Kind, Partial<Spec>>>;
+}
+export const FACTIONS: Record<FactionId, Faction> = {
+  crown: {
+    id: "crown",
+    name: "Crownguard",
+    crest: "♜",
+    blurb: "Sturdy footmen and archers led by a hammer-wielding Commander.",
+    specs: {},
+  },
+  orc: {
+    id: "orc",
+    name: "Ironhide Clans",
+    crest: "⚒",
+    blurb: "Hard-hitting brutes and spear throwers; the Warlord's War Cry.",
+    specs: {
+      worker: { name: "Laborer", hp: 250 },
+      soldier: {
+        name: "Brute",
+        hp: 520,
+        gold: 150,
+        armor: 2,
+        damage: [15, 18],
+        cooldown: 1.5,
+        speed: 250 * WC3,
+      },
+      archer: {
+        name: "Spear Thrower",
+        hp: 320,
+        gold: 135,
+        wood: 20,
+        damage: [21, 25],
+        range: 450 * WC3,
+        cooldown: 1.9,
+        speed: 260 * WC3,
+      },
+      hero: {
+        name: "Warlord",
+        hp: 720,
+        armor: 3,
+        damage: [27, 37],
+        cooldown: 2.3,
+        speed: 260 * WC3,
+      },
+      base: { name: "Warhold", hp: 1700 },
+      farm: { name: "Longhouse", hp: 550 },
+      barracks: { name: "War Camp", hp: 1600 },
+      altar: { name: "Totem Ring", hp: 950 },
+    },
+  },
+  elf: {
+    id: "elf",
+    name: "Sylvan Wardens",
+    crest: "❦",
+    blurb: "Swift bladedancers and far-reaching longbows; the Moonseer heals.",
+    specs: {
+      worker: { name: "Tender", hp: 220, speed: 200 * WC3 },
+      soldier: {
+        name: "Bladedancer",
+        hp: 360,
+        gold: 125,
+        time: 18,
+        armor: 1,
+        armorType: "medium",
+        damage: [11, 13],
+        cooldown: 1.1,
+        speed: 300 * WC3,
+        sight: 12,
+      },
+      archer: {
+        name: "Longbow",
+        hp: 245,
+        gold: 135,
+        wood: 20,
+        damage: [15, 17],
+        range: 600 * WC3,
+        cooldown: 1.45,
+        speed: 280 * WC3,
+        sight: 15,
+      },
+      hero: {
+        name: "Moonseer",
+        hp: 560,
+        armor: 3,
+        damage: [20, 28],
+        range: 500 * WC3,
+        cooldown: 1.8,
+        speed: 290 * WC3,
+        sight: 15,
+      },
+      base: { name: "Heartwood", hp: 1400 },
+      farm: { name: "Seedhome", hp: 450 },
+      barracks: { name: "Glade Hall", hp: 1400 },
+      altar: { name: "Starstone", hp: 850 },
+    },
+  },
+};
+const merged = new Map<string, Spec>();
+/** Stats of a kind as fielded by a faction. */
+export function spec(kind: Kind, faction: FactionId = "crown"): Spec {
+  const key = `${faction}:${kind}`;
+  let s = merged.get(key);
+  if (!s) {
+    s = { ...SPECS[kind], ...FACTIONS[faction].specs[kind] };
+    merged.set(key, s);
+  }
+  return s;
+}

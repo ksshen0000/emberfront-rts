@@ -1,4 +1,11 @@
-import { SPECS, WC3, type Kind, type Spec } from "./config";
+import {
+  SPECS,
+  WC3,
+  spec,
+  type FactionId,
+  type Kind,
+  type Spec,
+} from "./config";
 // Hero rules after Warcraft III: experience from nearby kills, ten levels,
 // one skill point per level and a mana-fuelled active ability.
 export interface Hero {
@@ -6,10 +13,10 @@ export interface Hero {
   xp: number;
   /** Unspent skill points. */
   points: number;
-  /** Learned rank of the Quake Slam ability, 0 until learned. */
-  slam: number;
+  /** Learned rank of the hero's ability, 0 until learned. */
+  rank: number;
   mana: number;
-  /** Seconds until Quake Slam can be cast again. */
+  /** Seconds until the ability can be cast again. */
   recharge: number;
 }
 export const HERO_MAX_LEVEL = 10;
@@ -20,21 +27,80 @@ const UNIT_XP = [0, 25, 40, 60, 85, 115];
 const HERO_KILL_XP = [100, 120, 160, 220, 300, 400, 500, 600, 700, 800];
 /** Heroes of the killer's side within this range share the experience. */
 export const XP_RANGE = 1200 * WC3;
-// Quake Slam: the hero strikes the ground, damaging and stunning enemy units
-// around it. Spell damage ignores armour; heroes are stunned for half as long.
-export const SLAM = {
-  name: "Quake Slam",
-  ranks: 3,
-  damage: [70, 120, 170],
-  stun: [2, 2.5, 3],
-  radius: 250 * WC3,
-  mana: 90,
-  cooldown: 8,
+// Each faction's hero has one active ability, instant and centred on the hero.
+export interface Ability {
+  name: string;
+  /** slam: damage and stun enemies; cry: frenzy allies; bloom: heal allies. */
+  effect: "slam" | "cry" | "bloom";
+  ranks: number;
+  radius: number;
+  mana: number;
+  cooldown: number;
+  /** Per rank: damage, attack-speed bonus or healing. */
+  power: number[];
+  /** Per rank: stun or frenzy seconds (unused for healing). */
+  duration: number[];
+}
+export const ABILITIES: Record<FactionId, Ability> = {
+  // The Commander strikes the ground, damaging and stunning enemy units
+  // around it. Spell damage ignores armour; heroes are stunned half as long.
+  crown: {
+    name: "Quake Slam",
+    effect: "slam",
+    ranks: 3,
+    radius: 250 * WC3,
+    mana: 90,
+    cooldown: 8,
+    power: [70, 120, 170],
+    duration: [2, 2.5, 3],
+  },
+  // The Warlord's roar drives nearby troops into a frenzy: faster attacks and
+  // a quicker step for a few seconds.
+  orc: {
+    name: "War Cry",
+    effect: "cry",
+    ranks: 3,
+    radius: 600 * WC3,
+    mana: 75,
+    cooldown: 14,
+    power: [0.2, 0.3, 0.4],
+    duration: [6, 8, 10],
+  },
+  // The Moonseer's bloom heals every friendly unit around her.
+  elf: {
+    name: "Verdant Bloom",
+    effect: "bloom",
+    ranks: 3,
+    radius: 400 * WC3,
+    mana: 100,
+    cooldown: 10,
+    power: [120, 190, 260],
+    duration: [0, 0, 0],
+  },
 };
+/** One-line summary of an ability's rank (0-based) for the command card. */
+export function describeAbility(a: Ability, rank: number) {
+  return a.effect === "slam"
+    ? `${a.power[rank]} dmg · ${a.duration[rank]}s stun`
+    : a.effect === "cry"
+      ? `+${Math.round(a.power[rank] * 100)}% attack speed · ${a.duration[rank]}s`
+      : `Heals ${a.power[rank]} around`;
+}
+/** The Crownguard ability, kept under its old name for tests and tooling. */
+export const SLAM = {
+  ...ABILITIES.crown,
+  damage: ABILITIES.crown.power,
+  stun: ABILITIES.crown.duration,
+};
+/** Move-speed bonus while frenzied, as a share of the attack-speed bonus. */
+export const FRENZY_STRIDE = 0.5;
 /** A rank needs hero level 1, 3 and 5 respectively, as in WC3. */
-export const slamLevel = (rank: number) => rank * 2 - 1;
-export function heroSpec(level: number): Spec & { mana: number } {
-  const s = SPECS.hero,
+export const rankLevel = (rank: number) => rank * 2 - 1;
+export function heroSpec(
+  level: number,
+  faction: FactionId = "crown",
+): Spec & { mana: number } {
+  const s = spec("hero", faction),
     n = level - 1;
   return {
     ...s,
@@ -49,19 +115,23 @@ export const heroRegen = (level: number) => ({
   hp: 1 + 0.1 * (level - 1),
   mana: 0.7 + 0.05 * (level - 1),
 });
-export function newHero(): Hero {
+export function newHero(faction: FactionId = "crown"): Hero {
   return {
     level: 1,
     xp: 0,
     points: 1,
-    slam: 0,
-    mana: heroSpec(1).mana,
+    rank: 0,
+    mana: heroSpec(1, faction).mana,
     recharge: 0,
   };
 }
 /** Stats of any entity: heroes use their level, everything else its kind. */
-export function specOf(e: { kind: Kind; hero?: Hero }): Spec {
-  return e.hero ? heroSpec(e.hero.level) : SPECS[e.kind];
+export function specOf(e: {
+  kind: Kind;
+  hero?: Hero;
+  faction?: FactionId;
+}): Spec {
+  return e.hero ? heroSpec(e.hero.level, e.faction) : spec(e.kind, e.faction);
 }
 export function killXp(victim: { kind: Kind; hero?: Hero }) {
   return victim.hero

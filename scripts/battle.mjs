@@ -1,6 +1,6 @@
 // Headless AI-vs-AI battle: runs the real simulation with both sides on the
 // built-in AI and writes a readable battle log for debugging.
-// Usage: npm run battle -- [--minutes 30] [--seed 1] [--games 1]
+// Usage: npm run battle -- [--minutes 30] [--seed 1] [--games 1] [--map emerald] [--factions crown,orc]
 import { createServer } from "vite";
 import { mkdirSync, writeFileSync } from "node:fs";
 
@@ -10,7 +10,14 @@ const arg = (name, fallback) => {
 };
 const minutes = arg("minutes", 30),
   firstSeed = arg("seed", 1),
-  games = arg("games", 1);
+  games = arg("games", 1),
+  mapIndex = process.argv.indexOf("--map"),
+  map = mapIndex > 0 ? process.argv[mapIndex + 1] : "emerald",
+  factionIndex = process.argv.indexOf("--factions"),
+  factions =
+    factionIndex > 0
+      ? process.argv[factionIndex + 1].split(",")
+      : ["crown", "crown"];
 
 const vite = await createServer({
   server: { middlewareMode: true },
@@ -27,7 +34,7 @@ const side = ["BLUE", "RED ", "----"];
 
 for (let g = 0; g < games; g++) {
   const seed = firstSeed + g,
-    w = new World();
+    w = new World(map, factions);
   w.seed = seed;
   w.aiPlayers = [0, 1];
   w.logging = true;

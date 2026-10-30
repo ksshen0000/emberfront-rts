@@ -16,10 +16,15 @@
       <header class="topbar">
         <a class="brand" href="#" aria-label="EMBERFRONT"
           ><span class="crest">♜</span
-          ><span>EMBERFRONT<small>THE EMERALD MARCHES</small></span></a
+          ><span
+            >EMBERFRONT<small class="map-name upper"
+              >THE EMERALD MARCHES</small
+            ></span
+          ></a
         >
         <div class="match-label">
-          <i></i> Skirmish <span>/</span> Emerald Marches
+          <i></i> Skirmish <span>/</span>
+          <b class="map-name">Emerald Marches</b>
         </div>
         <div class="resources">
           <div title="Workers mine gold and return it to the stronghold">
@@ -96,8 +101,8 @@
         ></span>
       </button>
       <div class="map-label">
-        <span>THE EMERALD MARCHES</span><i></i> Emerald Marches · Uncharted war.
-        Open terrain.
+        <span class="map-name upper">THE EMERALD MARCHES</span><i></i>
+        <b class="map-blurb"></b>
       </div>
       <div id="toast" role="status" aria-live="polite"></div>
       <div id="mode-hint"></div>
@@ -106,7 +111,9 @@
       <footer class="command-deck">
         <section class="minimap-panel">
           <div class="panel-heading">
-            <span><i class="team-dot"></i> Emerald Marches</span
+            <span
+              ><i class="team-dot"></i>
+              <b class="map-name">Emerald Marches</b></span
             ><button id="home" title="Return to stronghold">⌂</button>
           </div>
           <canvas
@@ -141,7 +148,9 @@
         </section>
       </footer>
       <div class="statusline">
-        <span><i></i> LOCAL SKIRMISH <b>·</b> Azure Guard vs Ember Legion</span
+        <span
+          ><i></i> LOCAL SKIRMISH <b>·</b>
+          <b class="matchup">Azure Guard vs Ember Legion</b></span
         ><span id="stats">BABYLON.JS · PLAYABLE PROTOTYPE</span>
       </div>
       <div id="modal" class="modal-backdrop" hidden>
@@ -151,7 +160,8 @@
           <div id="modal-body"></div>
           <div class="modal-actions">
             <button id="resume" class="primary">Resume battle</button
-            ><button id="restart">New battle</button>
+            ><button id="restart">New battle</button
+            ><button id="main-menu">Main menu</button>
           </div>
           <label class="fx-toggle"
             ><input type="checkbox" id="effects" checked /> Simple combat
@@ -163,6 +173,24 @@
             ><input type="checkbox" id="confine" checked /> Confine the mouse to
             the game window</label
           >
+        </div>
+      </div>
+    </div>
+    <div id="menu" class="menu-backdrop" hidden>
+      <div class="menu" role="dialog" aria-labelledby="menu-title">
+        <span class="eyebrow">EMBERFRONT · SKIRMISH</span>
+        <h1 id="menu-title">Raise your banner</h1>
+        <p class="menu-lead">
+          Choose a faction and a battlefield, then face the AI.
+        </p>
+        <h3>Faction</h3>
+        <div id="menu-factions" class="menu-cards"></div>
+        <h3>Opponent (AI)</h3>
+        <div id="menu-enemy" class="menu-cards"></div>
+        <h3>Battlefield</h3>
+        <div id="menu-maps" class="menu-cards"></div>
+        <div class="menu-actions">
+          <button id="menu-start" class="primary">Start battle</button>
         </div>
       </div>
     </div>

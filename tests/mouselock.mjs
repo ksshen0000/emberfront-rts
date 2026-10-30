@@ -102,7 +102,7 @@ const relock = async () => {
   );
 };
 try {
-  await page.goto("http://127.0.0.1:5173");
+  await page.goto("http://127.0.0.1:5173/?play");
   await page.waitForFunction(() => window.rts?.view);
   await page.mouse.move(720, 420);
   await relock();

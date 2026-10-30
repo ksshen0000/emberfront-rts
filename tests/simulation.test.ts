@@ -7,9 +7,16 @@ import {
   type Entity,
 } from "../src/simulation/world";
 import { Navigation } from "../src/simulation/navigation";
-import { HERO_XP, SLAM, heroSpec, reviveCost } from "../src/simulation/hero";
+import {
+  ABILITIES,
+  HERO_XP,
+  SLAM,
+  heroSpec,
+  reviveCost,
+} from "../src/simulation/hero";
 import {
   FORDS,
+  MAPS,
   PLATEAUS,
   heightAt,
   layout,
@@ -27,6 +34,7 @@ import {
   QUEUE_MAX,
   distance,
   isUnit,
+  spec,
 } from "../src/simulation/config";
 const advance = (w: World, seconds: number) => {
   for (let i = 0; i < Math.round(seconds / STEP); i++) w.step();
@@ -93,6 +101,8 @@ describe("economy and lifecycle", () => {
     advance(w, SPECS.worker.time + 2);
     expect(b.queue).toHaveLength(1);
     expect(w.population(0).used).toBe(15);
+    expect(b.queue[0].blocked).toBe(true);
+    expect(w.messages.at(-1)).toMatch(/waiting for food/);
     w.spawn("farm", 0, 34.5, 20.5);
     w.rebuild();
     w.step();
@@ -142,6 +152,81 @@ describe("economy and lifecycle", () => {
     expect(b.progress).toBe(1);
     expect(b.hp).toBeCloseTo(SPECS.barracks.hp);
     w.assertInvariants();
+  });
+  it("a new site never takes a worker from one under construction", () => {
+    const w = fresh(),
+      crew = w
+        .own(0)
+        .filter((e) => e.kind === "worker")
+        .slice(0, 3),
+      ids = crew.map((e) => e.id);
+    w.players[0] = { gold: 2000, wood: 2000 };
+    // First legal spot for each building, scanning outward from the base.
+    const site = (kind: "farm" | "barracks" | "altar") => {
+      const b = base(w);
+      for (let r = 6; r < 20; r++)
+        for (let a = 0; a < 16; a++) {
+          const p = w.snap(kind, {
+            x: b.x + Math.cos((a / 16) * Math.PI * 2) * r,
+            z: b.z + Math.sin((a / 16) * Math.PI * 2) * r,
+          });
+          if (!w.placement(kind, p)) return p;
+        }
+      throw new Error(`no site for ${kind}`);
+    };
+    for (const kind of ["farm", "barracks", "altar"] as const) {
+      w.submit({ player: 0, ids, type: "build", kind, point: site(kind) });
+      w.step();
+    }
+    advance(w, 100);
+    for (const kind of ["farm", "barracks", "altar"])
+      expect(w.own(0).find((e) => e.kind === kind)!.progress).toBe(1);
+    w.assertInvariants();
+  });
+  it("a builder returns to its mine once the building stands", () => {
+    const w = fresh(),
+      u = worker(w),
+      mine = [...w.entities.values()].find((e) => e.kind === "gold")!;
+    w.submit({ player: 0, ids: [u.id], type: "gather", target: mine.id });
+    advance(w, 5);
+    w.submit({
+      player: 0,
+      ids: [u.id],
+      type: "build",
+      kind: "farm",
+      point: { x: 34.5, z: 24.5 },
+    });
+    advance(w, SPECS.farm.time + 15);
+    expect(w.own(0).find((e) => e.kind === "farm")!.progress).toBe(1);
+    expect(u.order).toEqual({ type: "gather", target: mine.id });
+  });
+  it("a worker sent to an unreachable tree takes a reachable one", () => {
+    const w = fresh(),
+      u = worker(w),
+      trees = [...w.entities.values()].filter((e) => e.kind === "tree"),
+      walled = trees.find((t) => !w.interactPoint(u, t))!;
+    expect(walled).toBeDefined();
+    const wood = w.players[0].wood;
+    w.submit({ player: 0, ids: [u.id], type: "gather", target: walled.id });
+    advance(w, 90);
+    expect(u.order.type).toBe("gather");
+    expect(w.players[0].wood).toBeGreaterThan(wood);
+  });
+  it("names the missing resource", () => {
+    const w = fresh();
+    w.players[0] = { gold: 1000, wood: 0 };
+    w.submit({ player: 0, ids: [base(w).id], type: "train", kind: "worker" });
+    w.step();
+    w.submit({
+      player: 0,
+      ids: [worker(w).id],
+      type: "build",
+      kind: "farm",
+      point: { x: 34.5, z: 24.5 },
+    });
+    w.step();
+    expect(w.messages.at(-1)).toMatch(/wood/i);
+    expect(w.messages.at(-1)).not.toMatch(/gold/i);
   });
   it("releases reservation and does not refund destroyed production", () => {
     const w = fresh(),
@@ -554,7 +639,7 @@ describe("heroes", () => {
     expect(w.population(0).reserved).toBe(SPECS.hero.food);
     advance(w, SPECS.hero.time + 2);
     const h = w.heroOf(0)!;
-    expect(h.hero).toMatchObject({ level: 1, xp: 0, points: 1, slam: 0 });
+    expect(h.hero).toMatchObject({ level: 1, xp: 0, points: 1, rank: 0 });
     expect(h.hp).toBe(SPECS.hero.hp);
     w.submit({ player: 0, ids: [a.id], type: "train", kind: "hero" });
     w.step();
@@ -596,23 +681,23 @@ describe("heroes", () => {
       w.step();
     };
     learn();
-    expect(h.slam).toBe(1);
+    expect(h.rank).toBe(1);
     h.points = 3;
     h.level = 2;
     learn();
-    expect(h.slam).toBe(1);
+    expect(h.rank).toBe(1);
     h.level = 3;
     learn();
-    expect(h.slam).toBe(2);
+    expect(h.rank).toBe(2);
     learn();
-    expect(h.slam).toBe(2);
+    expect(h.rank).toBe(2);
     expect(h.points).toBe(2);
   });
   it("Quake Slam damages and stuns enemies around the commander", () => {
     const w = fresh(),
       e = hero(w),
       h = e.hero!;
-    h.slam = 1;
+    h.rank = 1;
     h.points = 0;
     const near = w.spawn("soldier", 1, 65.5, 40),
       far = w.spawn("soldier", 1, 70, 40),
@@ -656,7 +741,7 @@ describe("heroes", () => {
       a = altar(w),
       e = hero(w);
     e.hero!.level = 4;
-    e.hero!.slam = 2;
+    e.hero!.rank = 2;
     e.hp = 0;
     w.step();
     expect(w.heroOf(0)).toBeUndefined();
@@ -673,7 +758,7 @@ describe("heroes", () => {
     w.submit({ player: 0, ids: [a.id], type: "train", kind: "hero" });
     advance(w, cost.time + 2);
     const back = w.heroOf(0)!;
-    expect(back.hero).toMatchObject({ level: 4, slam: 2 });
+    expect(back.hero).toMatchObject({ level: 4, rank: 2 });
     expect(back.hp).toBe(heroSpec(4).hp);
     expect(back.hero!.mana).toBe(heroSpec(4).mana);
     expect(w.fallen[0]).toBeNull();
@@ -709,8 +794,172 @@ describe("heroes", () => {
       expect(w.own(owner).some((e) => e.kind === "altar")).toBe(true);
       const events = w.log.filter((l) => l.owner === owner);
       expect(events.some((l) => l.event === "learn")).toBe(true);
-      expect(events.some((l) => l.event === "slam")).toBe(true);
+      expect(events.some((l) => l.event === "cast")).toBe(true);
     }
     w.assertInvariants();
   }, 30000);
+});
+
+describe("maps", () => {
+  for (const def of MAPS)
+    describe(def.name, () => {
+      it("is the same from both sides", () => {
+        const w = new World(def.id);
+        w.aiEnabled = false;
+        const key = (p: { kind: string; x: number; z: number }) =>
+          `${p.kind}:${p.x}:${p.z}`;
+        const all = layout(),
+          keys = new Set(all.map(key));
+        for (const p of all)
+          expect(keys.has(key({ ...p, ...mirror(p) }))).toBe(true);
+        for (let i = 0; i < 200; i++) {
+          const x = (i * 37.3) % 128,
+            z = (i * 71.9) % 128;
+          expect(heightAt(x, z)).toBeCloseTo(heightAt(128 - x, 128 - z), 5);
+        }
+      });
+      it("every mine and the enemy stronghold can be walked to", () => {
+        const w = new World(def.id);
+        w.aiEnabled = false;
+        const from = w.nav.nearest({ x: 28.5, z: 30.5 })!,
+          u = { ...worker(w), ...from };
+        for (const g of [...w.entities.values()].filter(
+          (e) => e.kind === "gold",
+        )) {
+          const spot = w.interactPoint(u, g);
+          expect(spot, `mine at ${g.x},${g.z}`).not.toBeNull();
+          expect(w.nav.path(from, spot!), `mine at ${g.x},${g.z}`).toBeTruthy();
+        }
+        const enemy = w.interactPoint(u, base(w, 1));
+        expect(w.nav.path(from, enemy!)).toBeTruthy();
+      });
+      it("plays an AI game without stuck units or invariant failures", () => {
+        const w = new World(def.id);
+        w.aiPlayers = [0, 1];
+        w.logging = true;
+        for (let i = 0; i < 480 / STEP; i++) {
+          w.step();
+          if (i % 400 === 0) w.assertInvariants();
+        }
+        for (const owner of [0, 1] as const) {
+          expect(
+            w.own(owner).filter((e) => e.kind === "barracks").length,
+          ).toBeGreaterThanOrEqual(1);
+          expect(w.hasHero(owner)).toBe(true);
+        }
+        expect(
+          w.log.filter((l) => l.event === "warn" && /reach/.test(l.detail)),
+        ).toEqual([]);
+      }, 30000);
+    });
+  it("Stonewatch Basin has no river and a shared mine on the mesa", () => {
+    new World("stonewatch");
+    expect(FORDS).toHaveLength(0);
+    const mines = layout().filter((p) => p.kind === "gold");
+    expect(mines).toHaveLength(7);
+    expect(mines.some((m) => m.x === 64 && m.z === 64)).toBe(true);
+    expect(tierAt(64, 58)).toBe(1);
+    new World();
+    expect(FORDS).toHaveLength(3);
+  });
+});
+
+describe("factions", () => {
+  const duel = (a: "crown" | "orc" | "elf", b: "crown" | "orc" | "elf") => {
+    const w = new World("emerald", [a, b]);
+    w.aiEnabled = false;
+    return w;
+  };
+  it("fields each faction's own units, prices and names", () => {
+    const w = duel("orc", "elf"),
+      hall = base(w);
+    expect(w.specFor("soldier", 0).name).toBe("Brute");
+    expect(w.specFor("soldier", 1).name).toBe("Bladedancer");
+    expect(hall.hp).toBe(spec("base", "orc").hp);
+    expect(base(w, 1).hp).toBe(spec("base", "elf").hp);
+    const barracks = w.spawn("barracks", 0, 36, 20);
+    w.rebuild();
+    w.players[0] = { gold: 1000, wood: 1000 };
+    w.submit({ player: 0, ids: [barracks.id], type: "train", kind: "soldier" });
+    w.step();
+    expect(w.players[0].gold).toBe(1000 - spec("soldier", "orc").gold);
+    expect(barracks.queue[0].time).toBe(spec("soldier", "orc").time);
+    // Cancelling refunds what was paid.
+    w.submit({ player: 0, ids: [barracks.id], type: "cancel", index: 0 });
+    w.step();
+    expect(w.players[0].gold).toBe(1000);
+    advance(w, 0.5);
+    const brute = w.spawn("soldier", 0, 64, 40);
+    expect(brute.hp).toBe(520);
+    expect(brute.faction).toBe("orc");
+  });
+  it("War Cry frenzies friendly troops: faster attacks and steps", () => {
+    const w = duel("orc", "crown"),
+      chief = w.spawn("hero", 0, 64, 40),
+      ally = w.spawn("soldier", 0, 66, 40),
+      foe = w.spawn("soldier", 1, 66.9, 40);
+    w.step();
+    chief.hero!.rank = 3;
+    w.setOrder(foe, { type: "idle" });
+    w.submit({ player: 0, ids: [chief.id], type: "cast" });
+    w.step();
+    const cry = ABILITIES.orc;
+    expect(ally.frenzy).toBeGreaterThan(cry.duration[2] - 0.2);
+    expect(ally.frenzyBonus).toBe(cry.power[2]);
+    expect(foe.frenzy).toBe(0);
+    // The next swing comes sooner than the brute's normal attack interval.
+    w.setOrder(ally, { type: "attack", target: foe.id });
+    for (let i = 0; i < 40 && ally.cooldown === 0; i++) w.step();
+    expect(ally.cooldown).toBeLessThan(spec("soldier", "orc").cooldown! / 1.3);
+  });
+  it("Verdant Bloom heals friends up to full health, never foes", () => {
+    const w = duel("elf", "crown"),
+      seer = w.spawn("hero", 0, 64, 40),
+      ally = w.spawn("archer", 0, 66, 40),
+      scratched = w.spawn("soldier", 0, 63, 40),
+      foe = w.spawn("soldier", 1, 65, 42);
+    w.step();
+    seer.hero!.rank = 1;
+    ally.hp = 50;
+    scratched.hp = spec("soldier", "elf").hp - 10;
+    foe.hp = 100;
+    w.setOrder(foe, { type: "idle" });
+    w.submit({ player: 0, ids: [seer.id], type: "cast" });
+    w.step();
+    expect(ally.hp).toBeCloseTo(50 + ABILITIES.elf.power[0], 0);
+    expect(scratched.hp).toBe(spec("soldier", "elf").hp);
+    expect(foe.hp).toBeLessThanOrEqual(100);
+  });
+  it("the Moonseer shoots from range", () => {
+    const w = duel("elf", "crown"),
+      seer = w.spawn("hero", 0, 64, 40),
+      foe = w.spawn("worker", 1, 69, 40);
+    w.setOrder(foe, { type: "idle" });
+    w.setOrder(seer, { type: "attack", target: foe.id });
+    w.step();
+    w.step();
+    expect(foe.hp).toBeLessThan(spec("worker", "crown").hp);
+    expect(distance(seer, foe)).toBeGreaterThan(4);
+    expect(w.effects.some((f) => f.ranged)).toBe(true);
+  });
+  for (const [a, b] of [
+    ["orc", "elf"],
+    ["elf", "crown"],
+    ["crown", "orc"],
+  ] as const)
+    it(`${a} vs ${b}: the AI develops, raises its hero, ${a} casts`, () => {
+      const w = new World("emerald", [a, b]);
+      w.aiPlayers = [0, 1];
+      w.logging = true;
+      for (let i = 0; i < 540 / STEP; i++) {
+        w.step();
+        if (i % 400 === 0) w.assertInvariants();
+      }
+      for (const owner of [0, 1] as const) expect(w.hasHero(owner)).toBe(true);
+      // Each faction plays blue in one of these games; its hero must cast.
+      expect(w.log.some((l) => l.owner === 0 && l.event === "cast")).toBe(true);
+      expect(
+        w.log.filter((l) => l.event === "warn" && /reach/.test(l.detail)),
+      ).toEqual([]);
+    }, 30000);
 });

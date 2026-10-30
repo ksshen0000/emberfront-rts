@@ -13,7 +13,7 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));
 try {
-  await page.goto("http://127.0.0.1:5173");
+  await page.goto("http://127.0.0.1:5173/?play");
   await page.waitForFunction(() => window.rts?.view);
   await page.mouse.move(900, 400);
   const snapshot = () =>

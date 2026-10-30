@@ -43,10 +43,12 @@ import {
   type World,
   type Entity,
 } from "../simulation/world";
-import { heroSpec, specOf, SLAM } from "../simulation/hero";
+import { ABILITIES, heroSpec, specOf } from "../simulation/hero";
+import { ParticlePool } from "./particles";
+import { buildModel, type Part } from "./models";
 import {
-  FORDS,
   LOWLAND,
+  currentMap,
   WATER_LEVEL,
   heightAt,
   layout,
@@ -76,42 +78,13 @@ interface View {
   mana: InstancedMesh | null;
   /** Spinning halo over a stunned unit's head. */
   stun: InstancedMesh | null;
+  /** Ring at the feet of a unit frenzied by War Cry. */
+  frenzy: InstancedMesh | null;
   /** Footprint half-width, for fog checks after the entity itself is gone. */
   half: number;
   /** Enemy building seen at least once: it stays drawn as last seen while fogged. */
   remembered: boolean;
 }
-type Part = {
-  [K in "box" | "cone" | "torus"]: K extends "box"
-    ? (
-        w: number,
-        h: number,
-        d: number,
-        x: number,
-        y: number,
-        z: number,
-        m: StandardMaterial,
-      ) => Mesh
-    : K extends "cone"
-      ? (
-          diameter: number,
-          height: number,
-          x: number,
-          y: number,
-          z: number,
-          m: StandardMaterial,
-          top?: number,
-          sides?: number,
-        ) => Mesh
-      : (
-          diameter: number,
-          thickness: number,
-          x: number,
-          y: number,
-          z: number,
-          m: StandardMaterial,
-        ) => Mesh;
-};
 // Deterministic per-entity variation so scenery looks hand-placed but stable.
 const hash = (id: number, salt: number) => {
   let h =
@@ -151,15 +124,12 @@ export class Battlefield {
   selection = new Set<number>();
   ghost: Mesh | null = null;
   ghostKind: BuildingKind | null = null;
+  /** Short one-off meshes: command markers, the slam ring, level-up halos. */
   effects: {
     mesh: Mesh;
     life: number;
     max: number;
-    from?: Vector3;
-    to?: Vector3;
-    arc?: boolean;
-    grow?: number;
-    /** Ground height under a growing effect. */
+    /** Ground height under a rising effect. */
     y?: number;
     /** Ring that widens flat along the ground to this scale. */
     flat?: number;
@@ -167,6 +137,11 @@ export class Battlefield {
     rise?: number;
   }[] = [];
   fx = true;
+  // Combat particles, 200 at most between them (requirements §6).
+  sparks!: ParticlePool;
+  dust!: ParticlePool;
+  arrows!: ParticlePool;
+  leaves!: ParticlePool;
   constructor(public canvas: HTMLCanvasElement) {
     this.engine = new Engine(canvas, true, {
       preserveDrawingBuffer: true,
@@ -349,18 +324,9 @@ export class Battlefield {
     // Shaded forest floor under every woodline.
     for (const t of resources)
       if (t.kind === "tree") blob(px(t.x), pz(t.z), 3.2 * k, "#2f42305c");
-    // Worn dirt road: down the east ramp, up over the overlook hill by its
-    // two ramps, through the centre ford and on to the enemy's ramp, drawn
-    // as a smooth curve in soft layers.
-    const half = [
-      { x: 24, z: 24 },
-      { x: 33, z: 25 },
-      { x: 43, z: 28 },
-      { x: 39, z: 38 },
-      { x: 46, z: 46 },
-      { x: 54, z: 54 },
-      FORDS[1],
-    ];
+    // Worn dirt road from base to base through the map centre, drawn as a
+    // smooth curve in soft layers.
+    const half = currentMap().road;
     const route = [...half, ...half.slice(0, -1).reverse().map(mirror)];
     const road = (width: number, color: string) => {
       ctx.strokeStyle = color;
@@ -760,18 +726,43 @@ export class Battlefield {
    * half-second effect can end before its shader is ready (or stall a frame).
    */
   prewarm() {
+    // Particle pools stay active from the first frame, so their shaders
+    // compile at startup with the rest of the scene.
+    const spark = MeshBuilder.CreateBox("sparks", { size: 0.16 }, this.scene);
+    spark.material = this.mat("spark", "#ffe1a0", true);
+    this.sparks = new ParticlePool(spark, 80);
+    const dust = MeshBuilder.CreatePolyhedron(
+      "dust",
+      { type: 1, size: 0.5 },
+      this.scene,
+    );
+    dust.material = this.mat("dust", "#d2c7a6");
+    this.dust = new ParticlePool(dust, 60);
+    const arrow = MeshBuilder.CreateBox(
+      "arrows",
+      { width: 0.06, height: 0.06, depth: 0.75 },
+      this.scene,
+    );
+    arrow.material = this.mat("arrow", "#f3e3b4", true);
+    this.arrows = new ParticlePool(arrow, 40);
+    const leaf = MeshBuilder.CreateBox(
+      "leaves",
+      { width: 0.2, height: 0.04, depth: 0.12 },
+      this.scene,
+    );
+    leaf.material = this.mat("leaf-glow", "#9be38a", true);
+    this.leaves = new ParticlePool(leaf, 20);
     const probe = MeshBuilder.CreateBox("probe", { size: 0.1 }, this.scene);
     probe.isPickable = false;
     probe.setEnabled(false);
     const once = (
       [
         ["slam", "#f0d79a", true],
+        ["war-cry", "#ee6a4c", true],
+        ["bloom", "#9be38a", true],
         ["levelup", "#ffe08a", true],
-        ["spark", "#ffe1a0", true],
-        ["arrow", "#f3e3b4", true],
         ["move-mark", "#d0e1ac", true],
         ["attack-mark", "#ee9b70", true],
-        ["dust", "#b9ad8c", false],
       ] as const
     ).map(([name, hex, emissive]) =>
       this.mat(name, hex, emissive).forceCompilationAsync(probe),
@@ -780,6 +771,7 @@ export class Battlefield {
     const instanced = (
       [
         ["stun", "#ffe08a"],
+        ["frenzy", "#ee6a4c"],
         ["mana", "#6f9be0"],
       ] as const
     ).map(([name, hex]) =>
@@ -934,93 +926,22 @@ export class Battlefield {
       e.owner === 0 ? "teal" : "red",
       e.owner === 0 ? "#438e9c" : "#b35040",
     );
-    const stone = this.mat("stone", "#c0b49a"),
-      dark = this.mat("dark", "#544b3c"),
-      wood = this.mat("wood", "#85694a"),
-      metal = this.mat("metal", "#d1d9ce");
+    const wood = this.mat("wood", "#85694a");
     const tone = Math.floor(hash(e.id, 1) * 3);
     const key =
       e.kind === "tree"
         ? `tree-${tone}`
         : e.owner === 2
           ? e.kind
-          : `${e.kind}-${e.owner}`;
-    const body = this.instance(key, root, ({ box, cone, torus }) => {
-      if (isUnit(e.kind)) {
-        box(0.5, 0.18, 0.45, 0, 0.1, 0, dark);
-        box(0.5, 0.65, 0.35, 0, 0.55, 0, team);
-        cone(
-          0.37,
-          0.36,
-          0,
-          1.06,
-          0,
-          e.kind === "worker" ? this.mat("skin", "#d5b28c") : metal,
-          0.32,
-          6,
-        );
-        if (e.kind === "worker") {
-          box(0.35, 0.4, 0.3, 0, 0.62, -0.27, wood);
-          box(0.1, 0.8, 0.1, 0.38, 0.65, 0.05, wood).rotation.z = -0.3;
-          box(0.33, 0.18, 0.12, 0.5, 1, 0.05, metal);
-        }
-        if (e.kind === "soldier") {
-          box(0.32, 0.55, 0.18, -0.4, 0.65, 0.13, team);
-          box(0.09, 0.95, 0.1, 0.38, 0.75, 0.1, metal);
-        }
-        if (e.kind === "archer") {
-          torus(0.7, 0.07, 0.4, 0.65, 0, wood).rotation.z = Math.PI / 2;
-          cone(0.48, 0.3, 0, 1.26, 0, team);
-        }
-        if (e.kind === "hero") {
-          const gold = this.mat("gold", "#e0b65e");
-          // Cape, pauldrons, crown and a two-handed hammer.
-          box(0.52, 0.8, 0.06, 0, 0.6, -0.22, team).rotation.x = 0.15;
-          for (const x of [-0.3, 0.3]) box(0.22, 0.14, 0.4, x, 0.9, 0, gold);
-          cone(0.42, 0.16, 0, 1.3, 0, gold, 0.42, 6);
-          box(0.08, 1.1, 0.08, 0.42, 0.75, 0.12, wood).rotation.z = -0.2;
-          box(0.34, 0.22, 0.22, 0.53, 1.28, 0.12, metal).rotation.z = -0.2;
-        }
-      } else if (isBuilding(e.kind)) {
-        const s = SPECS[e.kind].size;
-        // Deep footing so the building sits flush on gently sloping ground.
-        box(s, 0.8, s, 0, -0.1, 0, dark);
-        if (e.kind === "base") {
-          box(4, 3.4, 4, 0, 1.8, 0, stone);
-          cone(6, 2.5, 0, 4.5, 0, team);
-          for (const x of [-2.3, 2.3])
-            for (const z of [-2.3, 2.3]) {
-              box(1.35, 3.5, 1.35, x, 1.9, z, stone);
-              cone(2, 1.7, x, 4.3, z, team);
-            }
-          box(1.25, 1.8, 0.15, 0, 1.1, -2.05, dark);
-          box(0.8, 1.5, 0.12, 1.3, 2.7, -2.06, team);
-        } else if (e.kind === "altar") {
-          // Stepped dais with four standing stones around a glowing crystal.
-          box(3.4, 0.5, 3.4, 0, 0.35, 0, stone);
-          box(2.4, 0.5, 2.4, 0, 0.8, 0, stone);
-          for (const x of [-1.4, 1.4])
-            for (const z of [-1.4, 1.4]) {
-              box(0.45, 2.3, 0.45, x, 1.6, z, stone);
-              cone(0.6, 0.5, x, 3, z, team);
-            }
-          cone(0.9, 1.5, 0, 1.8, 0, this.mat("crystal", "#a6e0f0", true), 0, 5);
-          box(1.2, 0.2, 1.2, 0, 1.1, 0, team);
-        } else if (e.kind === "barracks") {
-          box(4.4, 2.3, 3.6, 0, 1.4, 0, stone);
-          cone(6.1, 2, 0, 3.5, 0, team).scaling.z = 0.8;
-          box(1.3, 1.6, 0.15, 0, 1.1, -1.85, dark);
-          for (const x of [-1.6, 1.6]) {
-            box(0.13, 3.8, 0.13, x, 2, -2.1, wood);
-            box(0.65, 0.9, 0.06, x + 0.25, 3.3, -2.1, team);
-          }
-        } else {
-          box(2.4, 1.5, 2.2, 0, 1, 0, stone);
-          cone(3.8, 1.5, 0, 2.45, 0, team);
-          box(0.6, 1, 0.1, 0, 0.75, -1.15, dark);
-          box(0.7, 0.6, 0.7, 1.05, 0.6, 1, this.mat("hay", "#c1a15d"));
-        }
-      } else if (e.kind === "tree") {
+          : `${e.kind}-${e.faction}-${e.owner}`;
+    const body = this.instance(key, root, (part) => {
+      const { box, cone } = part;
+      if (isUnit(e.kind) || isBuilding(e.kind))
+        buildModel(part, e.kind, e.faction, {
+          team,
+          mat: (name, hex, emissive) => this.mat(name, hex, emissive),
+        });
+      else if (e.kind === "tree") {
         const low = this.mat(
             `pine-${tone}`,
             ["#2e5145", "#335a3f", "#2a4a40"][tone],
@@ -1167,6 +1088,7 @@ export class Battlefield {
       carryKind: "",
       mana,
       stun: null,
+      frenzy: null,
       half: isUnit(e.kind) ? 0 : SPECS[e.kind].size / 2,
       remembered: false,
     };
@@ -1341,6 +1263,21 @@ export class Battlefield {
         v.stun.dispose();
         v.stun = null;
       }
+      if (e.frenzy > 0 && !v.frenzy) {
+        v.frenzy = this.overlay("frenzy", v.root, () => {
+          const m = MeshBuilder.CreateTorus(
+            "frenzy",
+            { diameter: 0.95, thickness: 0.07, tessellation: 16 },
+            this.scene,
+          );
+          m.material = this.mat("frenzy", "#ee6a4c", true);
+          return m;
+        });
+        v.frenzy.position.y = 0.1;
+      } else if (e.frenzy <= 0 && v.frenzy) {
+        v.frenzy.dispose();
+        v.frenzy = null;
+      }
       if (v.stun) {
         v.stun.rotation.y = world.time * 6;
         v.stun.rotation.x = Math.sin(world.time * 9) * 0.25;
@@ -1361,7 +1298,10 @@ export class Battlefield {
           e.kind === "hero",
       );
       if (v.mana && e.hero) {
-        const m = Math.max(0.01, e.hero.mana / heroSpec(e.hero.level).mana);
+        const m = Math.max(
+          0.01,
+          e.hero.mana / heroSpec(e.hero.level, e.faction).mana,
+        );
         v.mana.scaling.x = m;
         v.mana.position.set((-(1 - m) * v.barWidth) / 2, -0.2, -0.01);
       }
@@ -1396,7 +1336,6 @@ export class Battlefield {
     for (const effect of world.effects.splice(0))
       if (
         this.fx &&
-        this.effects.length < 80 &&
         (this.sees(world, effect.from) || this.sees(world, effect.to))
       ) {
         if (effect.burst) {
@@ -1423,38 +1362,14 @@ export class Battlefield {
           to.y = 0.1 + this.height(to.x, to.z);
         }
         if (effect.ranged) {
-          const arrow = MeshBuilder.CreateBox(
-            "arrow",
-            { width: 0.06, height: 0.06, depth: 0.75 },
-            this.scene,
-          );
-          arrow.material = this.mat("arrow", "#f3e3b4", true);
-          arrow.isPickable = false;
-          arrow.position.copyFrom(from);
-          const life = Math.min(
-            0.45,
-            0.12 + Vector3.Distance(from, to) * 0.035,
-          );
-          this.effects.push({
-            mesh: arrow,
-            life,
-            max: life,
-            from,
-            to,
-            arc: true,
-          });
-        } else {
-          const spark = MeshBuilder.CreateSphere(
-            "spark",
-            { diameter: 0.4, segments: 3 },
-            this.scene,
-          );
-          spark.material = this.mat("spark", "#ffe1a0", true);
-          spark.isPickable = false;
-          spark.position.copyFrom(to);
-          this.effects.push({ mesh: spark, life: 0.22, max: 0.22 });
-        }
+          const d = Vector3.Distance(from, to);
+          this.arrows.lob(from, to, Math.min(0.45, 0.12 + d * 0.035), d * 0.12);
+        } else this.spray(to, 4);
       }
+    for (const pool of this.pools()) {
+      if (!this.fx) pool.clear();
+      pool.update(dt);
+    }
     for (let i = this.effects.length - 1; i >= 0; i--) {
       const f = this.effects[i];
       f.life -= dt;
@@ -1462,20 +1377,6 @@ export class Battlefield {
       if (f.life <= 0) {
         f.mesh.dispose();
         this.effects.splice(i, 1);
-      } else if (f.from && f.to) {
-        const p = Vector3.Lerp(f.from, f.to, t);
-        // Arrows lob along a short arc and point along their flight.
-        const lift = f.arc
-          ? Math.sin(t * Math.PI) * Vector3.Distance(f.from, f.to) * 0.12
-          : 0;
-        p.y += lift;
-        if (f.arc) {
-          const dx = f.to.x - f.from.x,
-            dz = f.to.z - f.from.z,
-            climb = Math.cos(t * Math.PI) * 0.5;
-          f.mesh.rotation.set(-climb, Math.atan2(dx, dz), 0);
-        }
-        f.mesh.position.copyFrom(p);
       } else if (f.flat) {
         const k = 0.15 + f.flat * Math.sqrt(t);
         f.mesh.scaling.set(k, 1, k);
@@ -1483,33 +1384,81 @@ export class Battlefield {
       } else if (f.rise) {
         f.mesh.position.y = (f.y ?? 0) + t * f.rise;
         f.mesh.visibility = 1 - t * t;
-      } else if (f.grow) {
-        f.mesh.scaling.setAll(f.grow * (0.4 + t));
-        f.mesh.position.y = (f.y ?? 0) + 0.3 + t * f.grow * 0.4;
-        f.mesh.visibility = 1 - t;
       } else f.mesh.scaling.setAll(1 - t);
     }
   }
-  /** Quake Slam shockwave, or the golden halo of a hero gaining a level. */
-  burst(kind: "slam" | "levelup", at: Point) {
+  /** A hero ability's shockwave, or the golden halo of a hero gaining a level. */
+  burst(kind: "slam" | "cry" | "bloom" | "levelup", at: Point) {
     const y = this.height(at.x, at.z);
-    if (kind === "slam") {
+    if (kind !== "levelup") {
+      const a =
+          ABILITIES[kind === "slam" ? "crown" : kind === "cry" ? "orc" : "elf"],
+        [name, hex] =
+          kind === "slam"
+            ? ["slam", "#f0d79a"]
+            : kind === "cry"
+              ? ["war-cry", "#ee6a4c"]
+              : ["bloom", "#9be38a"];
       // Unit-diameter ring scaled out to the ability's radius.
       const ring = MeshBuilder.CreateTorus(
-        "slam",
+        name,
         { diameter: 1, thickness: 0.12, tessellation: 32 },
         this.scene,
       );
-      ring.material = this.mat("slam", "#f0d79a", true);
+      ring.material = this.mat(name, hex, true);
       ring.isPickable = false;
       ring.position.set(at.x, y + 0.15, at.z);
       this.effects.push({
         mesh: ring,
         life: 0.45,
         max: 0.45,
-        flat: SLAM.radius * 2,
+        flat: a.radius * 2,
       });
-      this.puff(new Vector3(at.x, y, at.z), 2.5);
+      for (let i = 0; i < 12; i++) {
+        const t = (i / 12) * Math.PI * 2 + Math.random() * 0.4,
+          v = a.radius * (1.6 + Math.random() * 0.6);
+        if (kind === "slam")
+          // Clods of earth thrown outward along the shockwave.
+          this.dust.throw(
+            at.x + Math.cos(t) * 0.6,
+            y + 0.2,
+            at.z + Math.sin(t) * 0.6,
+            Math.cos(t) * v,
+            2.2 + Math.random(),
+            Math.sin(t) * v,
+            0.45,
+            0.45,
+            9,
+          );
+        else if (kind === "cry")
+          // Embers flung up around the Warlord.
+          this.sparks.throw(
+            at.x,
+            y + 1.2,
+            at.z,
+            Math.cos(t) * 2.5,
+            3 + Math.random() * 2,
+            Math.sin(t) * 2.5,
+            0.4,
+            1.1,
+            8,
+          );
+        else {
+          // Leaves drifting up across the healed area.
+          const r = Math.random() * a.radius;
+          this.leaves.throw(
+            at.x + Math.cos(t) * r,
+            y + 0.3,
+            at.z + Math.sin(t) * r,
+            0,
+            1.6 + Math.random(),
+            0,
+            0.5,
+            1,
+            -1,
+          );
+        }
+      }
       return;
     }
     const halo = MeshBuilder.CreateTorus(
@@ -1522,17 +1471,51 @@ export class Battlefield {
     halo.position.set(at.x, y, at.z);
     this.effects.push({ mesh: halo, life: 0.5, max: 0.5, rise: 2.6, y });
   }
+  /** A dust cloud where a unit (size ~1) or building (size ~4) fell. */
   puff(at: Vector3, size: number) {
-    const mesh = MeshBuilder.CreateSphere(
-      "dust",
-      { diameter: 1, segments: 3 },
-      this.scene,
-    );
-    mesh.material = this.mat("dust", "#b9ad8c");
-    mesh.isPickable = false;
-    const y = this.height(at.x, at.z);
-    mesh.position.set(at.x, y + 0.3, at.z);
-    this.effects.push({ mesh, life: 0.7, max: 0.7, grow: size, y });
+    const y = this.height(at.x, at.z),
+      n = size > 2 ? 12 : 5;
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2,
+        r = Math.random() * size * 0.4,
+        v = 0.6 + Math.random() * size * 0.5;
+      this.dust.throw(
+        at.x + Math.cos(a) * r,
+        y + 0.3,
+        at.z + Math.sin(a) * r,
+        Math.cos(a) * v,
+        1 + Math.random() * 1.5,
+        Math.sin(a) * v,
+        0.5,
+        0.3 + size * 0.1,
+        // Dust slows and hangs rather than falling back.
+        2,
+      );
+    }
+  }
+  /** Sparks flying off a melee hit. */
+  spray(at: Vector3, n: number) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2,
+        v = 2 + Math.random() * 2;
+      this.sparks.throw(
+        at.x,
+        at.y,
+        at.z,
+        Math.cos(a) * v,
+        1.5 + Math.random() * 2.5,
+        Math.sin(a) * v,
+        0.25,
+        1,
+        14,
+      );
+    }
+  }
+  pools() {
+    return [this.sparks, this.dust, this.arrows, this.leaves];
+  }
+  particleCount() {
+    return this.pools().reduce((n, p) => n + p.count, 0);
   }
   pick(x: number, y: number) {
     const hit = this.scene.pick(
@@ -1612,6 +1595,7 @@ export class Battlefield {
     this.views.clear();
     for (const e of this.effects) e.mesh.dispose();
     this.effects = [];
+    for (const pool of this.pools()) pool.clear();
     this.preview(null);
     this.fogSnap = true;
     this.focus = { x: 32, z: 29 };
