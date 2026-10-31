@@ -1040,8 +1040,10 @@ export class World {
       );
       this.remove(e);
     }
-    const a = this.own(0).some((e) => e.kind === "base"),
-      b = this.own(1).some((e) => e.kind === "base");
+    // Victory counts completed strongholds only: a bare foundation that no
+    // worker is building must not keep the game alive after the last hall fell.
+    const a = this.own(0).some((e) => e.kind === "base" && e.progress === 1),
+      b = this.own(1).some((e) => e.kind === "base" && e.progress === 1);
     if (!a || !b) {
       this.result = !a && !b ? "draw" : a ? "win" : "loss";
       this.record(2, "result", this.result);
@@ -1471,8 +1473,16 @@ export class World {
 
     // Construction: finish abandoned sites, then farms ahead of the food cap.
     const sites = all.filter((e) => isBuilding(e.kind) && e.progress < 1),
-      builder = () =>
-        lumberjacks.shift() ?? workers.find((w) => job(w) === "gold");
+      // A worker already ordered to a site this tick must not be picked again:
+      // commands apply next step, so job() still reports its old order.
+      builders = new Set<number>(),
+      builder = () => {
+        const w =
+          lumberjacks.find((e) => !builders.has(e.id)) ??
+          workers.find((e) => job(e) === "gold" && !builders.has(e.id));
+        if (w) builders.add(w.id);
+        return w;
+      };
     for (const site of sites)
       if (
         !workers.some(

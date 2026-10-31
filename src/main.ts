@@ -916,7 +916,7 @@ function cost(kind: UnitKind | BuildingKind) {
 /** Level, experience, mana and ability readout for a selected commander. */
 function heroDetails(e: Entity) {
   const h = e.hero!,
-    s = heroSpec(h.level),
+    s = heroSpec(h.level, e.faction),
     top = h.level >= HERO_MAX_LEVEL,
     from = HERO_XP[h.level - 1],
     to = top ? from : HERO_XP[h.level],
@@ -990,7 +990,7 @@ function renderHeroCard() {
   card.classList.toggle("fallen", !hero);
   const h = hero?.hero ?? fallen,
     level = h?.level ?? 1,
-    s = heroSpec(level),
+    s = heroSpec(level, world.factions[0]),
     [hp, mana] = hero
       ? [hero.hp / s.hp, h!.mana / s.mana]
       : queued

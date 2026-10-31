@@ -963,3 +963,37 @@ describe("factions", () => {
       ).toEqual([]);
     }, 30000);
 });
+
+describe("regressions", () => {
+  it("a bare foundation does not keep a side alive after its hall falls", () => {
+    const w = fresh();
+    const main = base(w, 0);
+    // A 0% foundation far away is not a stronghold yet.
+    w.spawn("base", 0, 96.5, 100.5, false);
+    w.rebuild();
+    main.hp = 0;
+    w.step();
+    expect(w.result).toBe("loss");
+  });
+  it("the AI never orders the same worker to two abandoned sites in one tick", () => {
+    const w = fresh();
+    // Strip the AI's workers and leave two miners on gold (no lumberjacks).
+    for (const e of w.own(1).filter((e) => e.kind === "worker")) w.remove(e);
+    const mine = [...w.entities.values()].find((e) => e.kind === "gold")!;
+    const a = w.spawn("worker", 1, mine.x + 3, mine.z),
+      b = w.spawn("worker", 1, mine.x + 4, mine.z);
+    w.setOrder(a, { type: "gather", target: mine.id });
+    w.setOrder(b, { type: "gather", target: mine.id });
+    // Two abandoned foundations need two distinct builders.
+    w.spawn("farm", 1, 40.5, 40.5, false);
+    w.spawn("farm", 1, 44.5, 40.5, false);
+    w.rebuild();
+    w.players[1] = { gold: 5000, wood: 5000 };
+    w.ai(1);
+    const resumeIds = w.commands
+      .filter((c) => c.player === 1 && c.type === "resume")
+      .map((c) => c.ids[0]);
+    expect(resumeIds).toHaveLength(2);
+    expect(new Set(resumeIds).size).toBe(resumeIds.length);
+  });
+});
